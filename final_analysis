@@ -1,0 +1,1418 @@
+---
+title: "Age 1 Microbiome Dataset Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    fig_caption: true
+    code_folding: show
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+    library(MicrobiotaProcess)
+    library(phyloseq)
+    library(ggplot2)
+    library(tidyverse)
+    library(vegan)
+    library(coin)
+    library(reshape2)
+    library(ggnewscale)
+    library(ggrepel)
+    library(tibble)
+    library(dplyr)
+    library(RColorBrewer)
+})
+
+# Define color palette for all groups
+group_colors <- c(
+    "IGneg_Control_1" = "#00AED7",   # Light blue
+    "IGneg_Celiac_1" = "#FD9347",    # Orange
+    "IGpos_Control_1" = "#2E8B57",    # Sea green
+    "IGpos_Celiac_1" = "#E41A1C",     # Red
+    "Presort_Control_1" = "#984EA3",  # Purple
+    "Presort_Celiac_1" = "#FF7F00"    # Dark orange
+)
+```
+
+# Import and filter data for Age 1
+
+```{r load_data, message=FALSE, warning=FALSE}
+# Import data
+otuda <- read.table("./CD_data/cd_asv_table.txt", header=TRUE, 
+                    check.names=FALSE, comment.char="", row.names=1, sep="\t")
+otuda <- data.frame(t(otuda), check.names=FALSE)
+sampleda <- read.table("./CD_data/cd_meta.txt", header=TRUE, 
+                       row.names=1, check.names=FALSE, comment.char="")
+taxda <- read.table("./CD_data/cd_taxa.txt", header=TRUE, 
+                    row.names=1, check.names=FALSE, comment.char="")
+
+# Filter for Age 1 samples
+sampleda <- sampleda[sampleda$Age == "1year", ]
+otuda <- otuda[rownames(sampleda), ]
+taxda <- taxda[match(colnames(otuda), rownames(taxda)), ]
+
+# Convert to matrices
+otu_matrix <- as.matrix(otuda)
+#tax_matrix <- as.matrix(taxda)
+
+# Create phyloseq object
+#OTU <- phyloseq::otu_table(otu_matrix, taxa_are_rows=FALSE)
+#TAX <- phyloseq::tax_table(tax_matrix)
+#samples <- phyloseq::sample_data(sampleda)
+#rownames(samples) <- rownames(sampleda)
+
+# Combine into phyloseq object
+#psraw <- phyloseq::phyloseq(OTU, TAX, samples)
+library(phyloseq)
+
+
+# Print dimensions for debugging
+cat("Dimensions of otuda:", dim(otuda), "\n")
+cat("Dimensions of taxda before subsetting:", dim(taxda), "\n")
+
+# Ensure taxda only includes the taxa present in otuda
+taxda <- taxda[match(colnames(otuda), rownames(taxda)), ]
+
+# Check the dimensions again after subsetting
+cat("Dimensions of taxda after subsetting:", dim(taxda), "\n")
+
+# Check if there are any NA values in row names after subsetting
+if (any(is.na(rownames(taxda)))) {
+  stop("Some taxa in otuda were not found in taxda.")
+}
+
+
+# Convert taxda to matrix if not already done
+taxda <- as.matrix(taxda)
+
+# Create the phyloseq object
+psraw <- phyloseq(
+  otu_table(otuda, taxa_are_rows = FALSE),
+  sample_data(sampleda),
+  phyloseq::tax_table(taxda)  # Use tax_table to create taxonomyTable directly
+)
+
+
+
+# Remove samples with low reads
+#psraw <- phyloseq::prune_samples(phyloseq::sample_sums(psraw) >= sort(rowSums(phyloseq::otu_table(psraw)))[2], psraw)
+
+# Rarefy to even depth
+#et.seed(1024)
+#ps <- phyloseq::rarefy_even_depth(psraw)
+#print(ps)
+```
+
+```{r filtering}
+# Step 1: Remove extremely rare taxa first
+ps_filtered <- psraw %>%
+  # Keep taxa present in at least 2 samples
+  filter_taxa(function(x) sum(x > 0) >= 2, TRUE) %>%
+  # Keep taxa with at least 10 reads total across all samples
+  filter_taxa(function(x) sum(x) >= 10, TRUE)
+
+# Print stats after initial filtering
+print("After initial filtering:")
+print(ntaxa(ps_filtered))
+
+# Step 2: Remove low prevalence taxa
+ps_filtered_prev <- ps_filtered %>%
+  # Present in at least 5% of samples
+  filter_taxa(function(x) sum(x > 0) >= (0.05 * nsamples(.)), TRUE)
+
+print("After prevalence filtering:")
+print(ntaxa(ps_filtered_prev))
+
+# Step 3: Transform to relative abundance
+ps_rel <- transform_sample_counts(ps_filtered_prev, function(x) x/sum(x))
+
+# Step 4: Optional rarefaction for certain analyses
+set.seed(1024)  # For reproducibility
+ps_rarefied <- rarefy_even_depth(ps_filtered_prev, 
+                                sample.size = 18000,  # Based on your minimum depth
+                                rngseed = TRUE)
+
+print(ntaxa(ps_rarefied))
+
+```
+
+
+
+\[Previous alpha diversity, taxonomic composition, and beta diversity analyses remain the same...\]
+
+# Differential Abundance Analysis with All Contrasts
+
+```{r differential_analysis, message=FALSE, warning=FALSE}
+
+##USE ps_rel in here!!
+# Function to perform Mann-Whitney tests for specific contrasts
+perform_differential_analysis <- function(physeq) {
+  # Extract tax_table and abundance data from phyloseq object
+  tax_table_df <- as.data.frame(phyloseq::tax_table(physeq))  # Convert to data frame
+  abundance_matrix <- as.matrix(phyloseq::otu_table(physeq))  # OTU table matrix
+  metadata_df <- as.data.frame(phyloseq::sample_data(physeq))  # Sample metadata
+
+  # Add full taxonomy information to tax_table
+  tax_table_df$full_taxonomy <- apply(tax_table_df, 1, function(x) {
+    paste(na.omit(x[c("Phylum", "Class", "Order", "Family", "Genus")]), collapse = "; ")
+  })
+
+  # Define contrasts for differential analysis
+  contrasts <- list(
+    Celiac_vs_Control_Presort_Age1 = list(group1 = "Presort_Celiac_1", group2 = "Presort_Control_1"),
+    Celiac_vs_Control_IGneg_Age1 = list(group1 = "IGneg_Celiac_1", group2 = "IGneg_Control_1"),
+    Celiac_vs_Control_IGpos_Age1 = list(group1 = "IGpos_Celiac_1", group2 = "IGpos_Control_1"),
+    IGpos_vs_IGneg_Control_Age1 = list(group1 = "IGpos_Control_1", group2 = "IGneg_Control_1"),
+    IGpos_vs_IGneg_Celiac_Age1 = list(group1 = "IGpos_Celiac_1", group2 = "IGneg_Celiac_1")
+  )
+
+  # Helper function to calculate fold change
+  calculate_fold_change <- function(group1_values, group2_values) {
+    median_group1 <- median(group1_values)
+    median_group2 <- median(group2_values)
+    median_diff <- median_group1 - median_group2
+
+    # Avoid division by zero for fold change calculation
+    if (median_group2 == 0) {
+      log2_fc <- ifelse(median_group1 == 0, 0, log2(median_group1 + 1e-6))
+    } else {
+      log2_fc <- log2((median_group1 + 1e-6) / (median_group2 + 1e-6))
+    }
+
+    return(c(median_diff, log2_fc))
+  }
+
+  results_list <- list()
+
+  for (contrast_name in names(contrasts)) {
+    contrast <- contrasts[[contrast_name]]
+
+    # Initialize results matrix
+    results <- matrix(NA, nrow = ncol(abundance_matrix), ncol = 7)
+    colnames(results) <- c("pvalue", "padj", "log2FoldChange", "median_group1", "median_group2", "median_difference", "effect_size")
+    rownames(results) <- colnames(abundance_matrix)
+
+    # Get samples for each group
+    group1_samples <- metadata_df$Group == contrast$group1
+    group2_samples <- metadata_df$Group == contrast$group2
+
+    # Loop through each taxon
+    for (i in 1:ncol(abundance_matrix)) {
+      group1_abundance <- abundance_matrix[group1_samples, i]
+      group2_abundance <- abundance_matrix[group2_samples, i]
+
+      # Skip if insufficient data
+      if (length(group1_abundance) < 3 || length(group2_abundance) < 3) {
+        next
+      }
+
+      # Check if there are enough unique values for a meaningful test
+      unique_values <- length(unique(c(group1_abundance, group2_abundance)))
+      if (unique_values < 2) {
+        next
+      }
+
+      # Perform Mann-Whitney test with error handling
+      tryCatch({
+        test <- wilcox.test(group1_abundance, group2_abundance, alternative = "two.sided", exact = FALSE)
+
+        # Calculate effect sizes
+        effects <- calculate_fold_change(group1_abundance, group2_abundance)
+
+        # Calculate Cliff's Delta
+        n1 <- length(group1_abundance)
+        n2 <- length(group2_abundance)
+        dominance <- sum(outer(group1_abundance, group2_abundance, ">")) - sum(outer(group1_abundance, group2_abundance, "<"))
+        cliff_delta <- dominance / (n1 * n2)
+
+        # Store results
+        results[i, "pvalue"] <- test$p.value
+        results[i, "median_group1"] <- median(group1_abundance)
+        results[i, "median_group2"] <- median(group2_abundance)
+        results[i, "median_difference"] <- effects[1]
+        results[i, "log2FoldChange"] <- effects[2]
+        results[i, "effect_size"] <- cliff_delta
+      }, error = function(e) {
+        results[i, ] <- NA
+      })
+    }
+
+    # Adjust p-values for multiple testing
+    valid_rows <- !is.na(results[, "pvalue"])
+    if (sum(valid_rows) > 0) {
+      results[valid_rows, "padj"] <- p.adjust(results[valid_rows, "pvalue"], method = "BH")
+    }
+
+    # Create results data frame
+    results_df <- data.frame(
+      Genus = tax_table_df$Genus,
+      fullTaxonomy = tax_table_df$full_taxonomy,
+      results,
+      stringsAsFactors = FALSE
+    )
+
+    results_df$Contrast <- contrast_name
+    results_df$Group1 <- contrast$group1
+    results_df$Group2 <- contrast$group2
+
+    # Create volcano plot
+    plot_df <- results_df[!is.na(results_df$padj) & !is.na(results_df$log2FoldChange), ]
+    plot_df$Significant <- ifelse(plot_df$padj < 0.05, "Significant", "Not Significant")
+
+    p <- ggplot(plot_df, aes(x = log2FoldChange, y = -log10(padj))) +
+      geom_point(aes(color = Significant, size = abs(effect_size)), alpha = 0.7) +
+      scale_color_manual(values = c("grey60", "red2")) +
+      scale_size_continuous(range = c(1, 4)) +
+      theme_bw() +
+      labs(title = paste("Differential Abundance -", contrast_name),
+           subtitle = paste("Group1:", contrast$group1, "\nGroup2:", contrast$group2),
+           x = "log2 Fold Change",
+           y = "-log10(adjusted p-value)",
+           size = "Effect Size") +
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+      geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey40") +
+      theme(legend.position = "right",
+            plot.title = element_text(size = 12, face = "bold"),
+            plot.subtitle = element_text(size = 10))
+
+    # Add labels for significant taxa
+    significant_taxa <- plot_df[plot_df$padj < 0.05 & abs(plot_df$log2FoldChange) > 1, ]
+    if (nrow(significant_taxa) > 0) {
+      p <- p + geom_text_repel(data = significant_taxa, aes(label = Genus), size = 3, max.overlaps = 15, box.padding = 0.5)
+    }
+
+    # Save volcano plot and results
+    ggsave(paste0("volcano_", gsub(" ", "_", contrast_name), ".pdf"), p, width = 10, height = 8)
+    write.csv(results_df, paste0("differential_abundance_", gsub(" ", "_", contrast_name), ".csv"), row.names = FALSE)
+
+    results_list[[contrast_name]] <- results_df
+  }
+
+  # Combine all results into a single data frame
+  all_results <- do.call(rbind, results_list)
+
+  # Generate summary statistics
+  summary_stats <- all_results %>%
+    filter(!is.na(padj) & padj < 0.05) %>%
+    group_by(Contrast) %>%
+    summarise(
+      Total_Significant = n(),
+      Strong_Increase = sum(log2FoldChange > 1, na.rm = TRUE),
+      Strong_Decrease = sum(log2FoldChange < -1, na.rm = TRUE),
+      Moderate_Change = sum(abs(log2FoldChange) <= 1, na.rm = TRUE),
+      Mean_Effect_Size = mean(abs(effect_size), na.rm = TRUE)
+    )
+
+  # Save summary statistics
+  write.csv(all_results, "differential_abundance_all_contrasts.csv", row.names = FALSE)
+  write.csv(summary_stats, "differential_abundance_summary.csv", row.names = FALSE)
+
+  return(list(results = results_list, summary = summary_stats))
+}
+
+# Run the differential analysis
+diff_abundance_results <- perform_differential_analysis(ps_rel)
+
+# Print summary of results
+cat("\nSummary of Differential Abundance Analysis:\n")
+print(diff_abundance_results$summary)
+
+# Print detailed results for each contrast
+for (contrast_name in names(diff_abundance_results$results)) {
+  cat(sprintf("\n\nSignificant genera for %s:\n", contrast_name))
+  results <- diff_abundance_results$results[[contrast_name]]
+  sig_results <- results[!is.na(results$padj) & results$padj < 0.05 & abs(results$log2FoldChange) > 1, ]
+
+  if (nrow(sig_results) > 0) {
+    sig_results <- sig_results[order(sig_results$padj), ]
+    print(sig_results %>%
+            select(Genus, fullTaxonomy, log2FoldChange, padj, effect_size) %>%
+            arrange(padj))
+  } else {
+    cat("No significant genera found with adjusted p < 0.05 and |log2FC| > 1\n")
+  }
+}
+```
+
+```{r}
+library(patchwork)
+library(tidyverse)
+library(dplyr)
+
+# Alpha Diversity Analysis
+
+##USE ps_filtered_prev in here!!
+# Calculate metrics
+alpha_div <- phyloseq::estimate_richness(ps_filtered_prev, measures=c("Observed", "Shannon", "Simpson"))
+alpha_div$CellType <- factor(gsub("(.+)_(.+)_.*", "\\1", sample_data(ps_filtered_prev)$Group),
+                            levels=c("Presort", "IGpos", "IGneg"))
+alpha_div$Disease.status <- factor(gsub("(.+)_(.+)_.*", "\\2", sample_data(ps_filtered_prev)$Group),
+                                 levels=c("Control", "Celiac"))
+
+# Function for statistical testing
+perform_stats <- function(data, metric) {
+    cell_types <- unique(data$CellType)
+    results <- data.frame()
+    
+    for(ct in cell_types) {
+        subset_data <- data[data$CellType == ct, ]
+        
+        # Get the metric values
+        metric_values <- subset_data[[metric]]
+        disease_status <- subset_data$Disease.status
+        
+        test <- wilcox.test(metric_values ~ disease_status, 
+                           exact=FALSE)
+        
+        # Calculate additional statistics
+        ctrl_values <- metric_values[disease_status == "Control"]
+        cel_values <- metric_values[disease_status == "Celiac"]
+        
+        results <- rbind(results, data.frame(
+            Metric = metric,
+            CellType = ct,
+            p_value = test$p.value,
+            Control_median = median(ctrl_values),
+            Control_IQR = paste(quantile(ctrl_values, 0.25), "-", quantile(ctrl_values, 0.75)),
+            Celiac_median = median(cel_values),
+            Celiac_IQR = paste(quantile(cel_values, 0.25), "-", quantile(cel_values, 0.75))
+        ))
+    }
+    return(results)
+}
+
+# Create plots and collect statistics
+plot_list <- list()
+all_stats <- data.frame()
+
+for(metric in c("Observed", "Shannon", "Simpson")) {
+    # Get statistical results
+    stat_results <- perform_stats(alpha_div, metric)
+    all_stats <- rbind(all_stats, stat_results)
+    
+    # Calculate y positions for annotations
+    y_positions <- alpha_div %>%
+        group_by(CellType) %>%
+        summarize(y_max = max(get(metric)) * 1.1)
+    
+    # Add FDR-corrected p-values
+    stat_results$adj_p_value <- p.adjust(stat_results$p_value, method="BH")
+    stat_results$significance <- ifelse(stat_results$adj_p_value < 0.001, "***",
+                                      ifelse(stat_results$adj_p_value < 0.01, "**",
+                                             ifelse(stat_results$adj_p_value < 0.05, "*", "ns")))
+    
+    # Create plot
+    p <- ggplot(alpha_div, aes(x = Disease.status, 
+                              y = .data[[metric]], 
+                              fill = Disease.status)) +
+        geom_violin(alpha = 0.7) +
+        geom_boxplot(width = 0.2, alpha = 0.7) +
+        geom_jitter(width = 0.2, size = 1, alpha = 0.6) +
+        facet_wrap(~CellType, ncol = 1) +
+        scale_fill_manual(values = c("Control" = "#00AED7", 
+                                   "Celiac" = "#FD9347")) +
+        theme_bw() +
+        theme(panel.grid.minor = element_blank(),
+              plot.title = element_text(size = 10, face = "bold"),
+              strip.background = element_rect(fill = "white"),
+              strip.text = element_text(face = "bold"),
+              legend.position = "none",
+              axis.title.x = element_blank()) +
+        labs(y = metric)
+    
+    # Add significance annotations
+    annotation_data <- merge(stat_results, y_positions)
+    
+    p <- p + geom_text(data = annotation_data,
+                       aes(x = 1.5, 
+                           y = y_max,
+                           label = significance),
+                       inherit.aes = FALSE,
+                       size = 3)
+    
+    plot_list[[metric]] <- p
+}
+
+# Combine plots side by side
+combined_plot <- plot_list$Observed + plot_list$Shannon + plot_list$Simpson +
+    plot_layout(ncol = 3) +
+    plot_annotation(
+        title = "Alpha Diversity Analysis",
+        subtitle = "Control vs Celiac comparison by cell type",
+        theme = theme(
+            plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+            plot.subtitle = element_text(size = 10, hjust = 0.5)
+        )
+    )
+
+# Save combined plot
+ggsave("alpha_diversity_all_metrics.pdf", 
+       combined_plot, 
+       width = 12, 
+       height = 8, 
+       dpi = 300)
+
+# Process statistics for output
+all_stats <- all_stats %>%
+    mutate(adj_p_value = p.adjust(p_value, method="BH")) %>%
+    mutate(Significance = ifelse(adj_p_value < 0.001, "***",
+                                ifelse(adj_p_value < 0.01, "**",
+                                       ifelse(adj_p_value < 0.05, "*", "ns")))) %>%
+    arrange(Metric, CellType) %>%
+    dplyr::select(Metric, CellType, 
+           Control_median, Control_IQR,
+           Celiac_median, Celiac_IQR,
+           p_value, adj_p_value, Significance)
+
+# Save comprehensive statistics
+write.csv(all_stats, "alpha_diversity_complete_statistics.csv", row.names = FALSE)
+
+# Print summary table
+print(knitr::kable(all_stats, 
+                   digits = 3,
+                   caption = "Complete Alpha Diversity Statistics"))
+```
+
+```{r}
+library(patchwork)
+library(tidyverse)
+
+# Beta Diversity Analysis
+##USE ps_rarefied for this
+# First, add CellType to sample data
+sample_data(ps_rarefied)$CellType <- factor(gsub("(.+)_(.+)_.*", "\\1", sample_data(ps_rarefied)$Group),
+                                  levels=c("Presort", "IGpos", "IGneg"))
+sample_data(ps_rarefied)$Disease.status <- factor(gsub("(.+)_(.+)_.*", "\\2", sample_data(ps_rarefied)$Group),
+                                       levels=c("Control", "Celiac"))
+
+# Function to perform PERMANOVA and get statistics
+perform_beta_stats <- function(ps_obj, cell_type) {
+    ps_subset <- subset_samples(ps_obj, CellType == cell_type)
+    metadata_subset <- data.frame(sample_data(ps_subset))
+    
+    # Calculate distances
+    bray_dist <- phyloseq::distance(ps_subset, method="bray")
+    
+    # Perform PERMANOVA
+    permanova <- adonis2(bray_dist ~ Disease.status, data=metadata_subset, permutations=9999)
+    
+    # Calculate centroids for each group
+    ord <- cmdscale(bray_dist, k=2)
+    centroids <- aggregate(ord, by=list(metadata_subset$Disease.status), mean)
+    
+    # Calculate dispersion
+    disp <- betadisper(bray_dist, metadata_subset$Disease.status)
+    disp_test <- permutest(disp, permutations=9999)
+    
+    return(list(
+        permanova = permanova,
+        dispersion = disp_test,
+        R2 = permanova$R2[1],
+        F_value = permanova$F[1],
+        p_value = permanova$`Pr(>F)`[1]
+    ))
+}
+
+# Function to create ordination plots (PCoA and NMDS)
+create_ordination_plots <- function(ps_obj, cell_type) {
+    ps_subset <- subset_samples(ps_obj, CellType == cell_type)
+    
+    # Calculate distances
+    bray_dist <- phyloseq::distance(ps_subset, method="bray")
+    
+    # Get statistics
+    stats <- perform_beta_stats(ps_obj, cell_type)
+    
+    # PCoA
+    pcoa <- ordinate(ps_subset, method="PCoA", distance=bray_dist)
+    pcoa_plot <- plot_ordination(ps_subset, pcoa, color="Disease.status") +
+        geom_point(size=3, alpha=0.7) +
+        stat_ellipse() +
+        scale_color_manual(values=c("Control"="#00AED7", "Celiac"="#FD9347")) +
+        theme_bw() +
+        theme(panel.grid.minor=element_blank(),
+              legend.position="none") +
+        ggtitle(paste0(cell_type, " - PCoA\n",
+                      "PERMANOVA R² = ", round(stats$R2, 3),
+                      ", p = ", round(stats$p_value, 3)))
+    
+    # NMDS
+    set.seed(1024)
+    nmds <- ordinate(ps_subset, method="NMDS", distance=bray_dist)
+    nmds_plot <- plot_ordination(ps_subset, nmds, color="Disease.status") +
+        geom_point(size=3, alpha=0.7) +
+        stat_ellipse() +
+        scale_color_manual(values=c("Control"="#00AED7", "Celiac"="#FD9347")) +
+        theme_bw() +
+        theme(panel.grid.minor=element_blank()) +
+        ggtitle(paste0(cell_type, " - NMDS\n",
+                      "stress = ", round(nmds$stress, 3)))
+    
+    return(list(pcoa=pcoa_plot, nmds=nmds_plot))
+}
+
+# Generate plots and statistics for each cell type
+cell_types <- c("Presort", "IGpos", "IGneg")
+plot_list <- list()
+all_stats <- data.frame()
+
+for(cell_type in cell_types) {
+    # Get ordination plots
+    plots <- create_ordination_plots(ps_rarefied, cell_type)
+    plot_list[[paste0(cell_type, "_pcoa")]] <- plots$pcoa
+    plot_list[[paste0(cell_type, "_nmds")]] <- plots$nmds
+    
+    # Collect statistics
+    stats <- perform_beta_stats(ps_rarefied, cell_type)
+    all_stats <- rbind(all_stats, data.frame(
+        CellType = cell_type,
+        Method = "PERMANOVA",
+        R2 = stats$R2,
+        F_statistic = stats$F_value,
+        p_value = stats$p_value,
+        stringsAsFactors = FALSE
+    ))
+}
+
+# Combine plots
+combined_plot <- (plot_list$Presort_pcoa + plot_list$Presort_nmds) /
+                (plot_list$IGpos_pcoa + plot_list$IGpos_nmds) /
+                (plot_list$IGneg_pcoa + plot_list$IGneg_nmds) +
+    plot_layout(guides = "collect") +
+    plot_annotation(
+        title = "Beta Diversity Analysis",
+        subtitle = "Control vs Celiac comparison by cell type",
+        theme = theme(
+            plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+            plot.subtitle = element_text(size = 10, hjust = 0.5)
+        )
+    )
+
+# Save plots and statistics
+ggsave("beta_diversity_ordination_plots.pdf", 
+       combined_plot, 
+       width = 12, 
+       height = 15, 
+       dpi = 300)
+
+write.csv(all_stats, "beta_diversity_statistics.csv", row.names = FALSE)
+```
+
+#Taxonomic Composition
+
+```{r}
+#use ps_filtered_prev with this
+library(patchwork)
+library(tidyverse)
+library(RColorBrewer)
+library(scales)
+
+# First, add CellType to the sample data of ps_filtered_prev
+# Extract sample data
+sample_data <- data.frame(sample_data(ps_filtered_prev))
+
+# Create CellType from Sort column
+sample_data$CellType <- sapply(as.character(sample_data$Sort), function(x) {
+  if(x == "Presort") return("Presort")
+  else if(x == "IGneg") return("IGneg")
+  else if(x == "IGpos") return("IGpos")
+  else return(NA)
+})
+
+# Update the sample data in the phyloseq object
+sample_data(ps_filtered_prev) <- sample_data(sample_data)
+
+# Create a large, distinct color palette
+create_color_palette <- function(n) {
+    # Combine multiple color brewer palettes and make them distinct
+    cols <- c(
+        brewer.pal(8, "Set2"),
+        brewer.pal(8, "Set1"),
+        brewer.pal(8, "Dark2"),
+        brewer.pal(8, "Paired"),
+        brewer.pal(8, "Accent")
+    )
+    # Remove any duplicate colors
+    cols <- unique(cols)
+    # If we need more colors, interpolate between existing ones
+    if(n > length(cols)) {
+        cols <- colorRampPalette(cols)(n)
+    }
+    return(cols[1:n])
+}
+
+# Function to process taxonomy at a specific level
+process_taxonomic_level <- function(ps_obj, tax_level, cell_type) {
+    # Convert to relative abundance
+    ps_rel <- transform_sample_counts(ps_obj, function(x) x/sum(x) * 100)
+    
+    # Agglomerate at specified level
+    ps_agg <- tax_glom(ps_rel, taxrank=tax_level, NArm=FALSE)
+    
+    # Extract abundance and taxonomy
+    otu_mat <- as(phyloseq::otu_table(ps_agg), "matrix")
+    tax_mat <- as(phyloseq::tax_table(ps_agg), "matrix")
+    
+    if(taxa_are_rows(ps_agg)) {
+        otu_mat <- t(otu_mat)
+    }
+    
+    # Create proper labels
+    tax_labels <- sapply(1:nrow(tax_mat), function(i) {
+        if(!is.na(tax_mat[i, tax_level])) {
+            if(tax_level == "Species") {
+                # For species, include genus name if available
+                genus <- tax_mat[i, "Genus"]
+                species <- tax_mat[i, "Species"]
+                if(!is.na(genus)) {
+                    return(paste(genus, species))
+                } else {
+                    return(species)
+                }
+            } else {
+                return(tax_mat[i, tax_level])
+            }
+        } else {
+            # Find the last classified level
+            prev_cols <- 1:which(colnames(tax_mat) == tax_level)
+            prev_level_idx <- max(which(!is.na(tax_mat[i, prev_cols])))
+            if(is.finite(prev_level_idx)) {
+                prev_level_name <- colnames(tax_mat)[prev_level_idx]
+                return(paste0("Unclassified_", tax_mat[i, prev_level_name]))
+            } else {
+                return("Unclassified")
+            }
+        }
+    })
+    
+    # Make labels unique
+    tax_labels <- make.unique(tax_labels, sep = "_")
+    colnames(otu_mat) <- tax_labels
+    
+    # Get metadata
+    metadata <- data.frame(sample_data(ps_agg))
+    
+    # Get top taxa (minimum abundance 0.1%)
+    mean_abund <- colMeans(otu_mat)
+    top_taxa <- names(sort(mean_abund[mean_abund > 0.1], decreasing=TRUE))
+    
+    if(length(top_taxa) == 0) {
+        return(NULL)
+    }
+    
+    # Prepare data for plotting
+    plot_data <- data.frame(otu_mat[, top_taxa, drop=FALSE]) %>%
+        mutate(Disease.status = metadata$Disease.status) %>%
+        pivot_longer(-Disease.status, 
+                    names_to = tax_level, 
+                    values_to = "Abundance")
+    
+    # Perform Mann-Whitney tests
+    test_results <- data.frame()
+    for(taxon in top_taxa) {
+        ctrl_values <- otu_mat[metadata$Disease.status == "Control", taxon]
+        cel_values <- otu_mat[metadata$Disease.status == "Celiac", taxon]
+        
+        if(length(ctrl_values) >= 3 && length(cel_values) >= 3) {
+            test <- wilcox.test(ctrl_values, cel_values, exact = FALSE)
+            
+            test_results <- rbind(test_results, data.frame(
+                Taxon = taxon,
+                Level = tax_level,
+                p_value = test$p.value,
+                Control_median = median(ctrl_values),
+                Control_IQR = paste(round(quantile(ctrl_values, 0.25), 2), "-", 
+                                  round(quantile(ctrl_values, 0.75), 2)),
+                Celiac_median = median(cel_values),
+                Celiac_IQR = paste(round(quantile(cel_values, 0.25), 2), "-", 
+                                 round(quantile(cel_values, 0.75), 2)),
+                log2FoldChange = log2((median(cel_values) + 1e-10)/(median(ctrl_values) + 1e-10))
+            ))
+        }
+    }
+    
+    if(nrow(test_results) > 0) {
+        test_results$adj_p_value <- p.adjust(test_results$p_value, method = "BH")
+        test_results$CellType <- cell_type
+    }
+    
+    # Create color palette
+    n_taxa <- length(unique(plot_data[[tax_level]]))
+    taxa_colors <- create_color_palette(n_taxa)
+    names(taxa_colors) <- unique(plot_data[[tax_level]])
+    
+    # Create stacked bar plot
+    mean_composition <- plot_data %>%
+        group_by(Disease.status, .data[[tax_level]]) %>%
+        summarise(Abundance = mean(Abundance), .groups = 'drop')
+    
+    p_stack <- ggplot(mean_composition, 
+                     aes(x = Disease.status, 
+                         y = Abundance, 
+                         fill = .data[[tax_level]])) +
+        geom_bar(stat = "identity", position = "stack") +
+        scale_fill_manual(values = taxa_colors) +
+        theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1),
+              legend.text = element_text(size = 8),
+              legend.position = "right",
+              legend.key.size = unit(0.5, "cm")) +
+        labs(title = paste(cell_type, "-", tax_level, "Composition"),
+             x = "Disease Status",
+             y = "Relative Abundance (%)",
+             fill = tax_level)
+    
+    return(list(
+        plot = p_stack,
+        stats = test_results
+    ))
+}
+
+# Create output directories
+dir.create("plots", showWarnings = FALSE)
+dir.create("stats", showWarnings = FALSE)
+
+# Process all taxonomic levels for each cell type
+cell_types <- c("Presort", "IGpos", "IGneg")
+tax_levels <- c("Phylum", "Class", "Order", "Family", "Genus", "Species")
+all_stats <- data.frame()
+plot_list <- list()
+
+# Print analysis progress
+cat("Starting taxonomic analysis...\n")
+
+for(cell_type in cell_types) {
+    cat(sprintf("\nProcessing %s samples\n", cell_type))
+    ps_subset <- subset_samples(ps_filtered_prev, CellType == cell_type)
+    
+    for(tax_level in tax_levels) {
+        cat(sprintf("  Analyzing %s level...\n", tax_level))
+        results <- process_taxonomic_level(ps_subset, tax_level, cell_type)
+        
+        if(!is.null(results)) {
+            if(!is.null(results$stats)) {
+                all_stats <- rbind(all_stats, results$stats)
+            }
+            plot_list[[paste(cell_type, tax_level)]] <- results$plot
+        }
+    }
+}
+
+# Save plots for each taxonomic level
+cat("\nGenerating and saving plots...\n")
+
+for(tax_level in tax_levels) {
+    if(all(paste(cell_types, tax_level) %in% names(plot_list))) {
+        # Combine plots for this level
+        combined_plots <- plot_list[[paste("Presort", tax_level)]] + 
+                         plot_list[[paste("IGpos", tax_level)]] + 
+                         plot_list[[paste("IGneg", tax_level)]] +
+            plot_layout(guides = "collect") +
+            plot_annotation(
+                title = paste(tax_level, "Level Composition"),
+                theme = theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5))
+            )
+        
+        # Save plot
+        filename <- file.path("plots", paste0("taxonomic_composition_", tolower(tax_level), ".pdf"))
+        ggsave(filename, combined_plots, width = 15, height = 8, dpi = 300)
+        cat(sprintf("  Saved %s\n", filename))
+    }
+}
+
+# Process and save statistics
+cat("\nProcessing statistical results...\n")
+
+if(nrow(all_stats) > 0) {
+    # Add significance levels
+    all_stats <- all_stats %>%
+        arrange(Level, CellType, adj_p_value) %>%
+        mutate(across(where(is.numeric), round, 3)) %>%
+        mutate(Significance = ifelse(adj_p_value < 0.001, "***",
+                                    ifelse(adj_p_value < 0.01, "**",
+                                           ifelse(adj_p_value < 0.05, "*", "ns"))))
+    
+    # Save complete statistics
+    write.csv(all_stats, 
+              file.path("stats", "taxonomic_composition_all_levels.csv"), 
+              row.names = FALSE)
+    cat("  Saved complete statistical results\n")
+    
+    # Save significant results by taxonomic level
+    for(tax_level in tax_levels) {
+        sig_stats <- all_stats %>%
+            filter(Level == tax_level, adj_p_value < 0.05) %>%
+            arrange(CellType, adj_p_value)
+        
+        filename <- file.path("stats", paste0("significant_taxa_", tolower(tax_level), ".csv"))
+        write.csv(sig_stats, filename, row.names = FALSE)
+        cat(sprintf("  Saved significant %s results\n", tax_level))
+    }
+    
+    # Print summary by taxonomic level
+    cat("\nSummary of significant findings:\n")
+    
+    for(tax_level in tax_levels) {
+        cat(sprintf("\n%s level:\n", tax_level))
+        summary_stats <- all_stats %>%
+            filter(Level == tax_level, adj_p_value < 0.05) %>%
+            group_by(CellType) %>%
+            summarise(
+                Total_Significant = n(),
+                Increased_in_Celiac = sum(log2FoldChange > 0),
+                Decreased_in_Celiac = sum(log2FoldChange < 0),
+                Mean_Effect_Size = mean(abs(log2FoldChange))
+            )
+        print(knitr::kable(summary_stats))
+    }
+}
+
+cat("\nAnalysis complete!\n")
+```
+
+#Taxonomic Analysis
+
+```{r}
+
+##USE ps_filtered_prev with this
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(cowplot)
+library(phyloseq)
+
+# Add CellType to the sample data of ps_filtered_prev
+sample_data <- data.frame(sample_data(ps_filtered_prev))
+
+# Create CellType from Sort column
+sample_data$CellType <- sapply(as.character(sample_data$Sort), function(x) {
+  if(x == "Presort") return("Presort")
+  else if(x == "IGneg") return("IGneg")
+  else if(x == "IGpos") return("IGpos")
+  else return(NA)
+})
+
+# Convert CellType to factor with specified order
+sample_data$CellType <- factor(sample_data$CellType, levels = c("Presort", "IGpos", "IGneg"))
+
+# Update the sample data in the phyloseq object
+sample_data(ps_filtered_prev) <- sample_data(sample_data)
+
+# Function to get abundances at specific taxonomic level
+get_level_abundances <- function(ps_obj, tax_level) {
+    # Convert to relative abundance
+    ps_rel <- transform_sample_counts(ps_obj, function(x) x/sum(x) * 100)
+    
+    # Agglomerate at specified level
+    ps_agg <- tax_glom(ps_rel, taxrank=tax_level, NArm=FALSE)
+    
+    # Extract abundance matrix
+    otu_mat <- as(phyloseq::otu_table(ps_agg), "matrix")
+    tax_mat <- as(phyloseq::tax_table(ps_agg), "matrix")
+    
+    if(taxa_are_rows(ps_agg)) {
+        otu_mat <- t(otu_mat)
+    }
+    
+    # Create proper taxonomic labels
+    tax_labels <- sapply(1:nrow(tax_mat), function(i) {
+        if(!is.na(tax_mat[i, tax_level])) {
+            if(tax_level == "Species") {
+                genus <- tax_mat[i, "Genus"]
+                species <- tax_mat[i, "Species"]
+                if(!is.na(genus)) {
+                    return(paste(genus, species))
+                } else {
+                    return(species)
+                }
+            } else {
+                return(tax_mat[i, tax_level])
+            }
+        } else {
+            prev_cols <- 1:which(colnames(tax_mat) == tax_level)
+            prev_level_idx <- max(which(!is.na(tax_mat[i, prev_cols])))
+            if(is.finite(prev_level_idx)) {
+                prev_level_name <- colnames(tax_mat)[prev_level_idx]
+                return(paste0("Unclassified_", tax_mat[i, prev_level_name]))
+            } else {
+                return("Unclassified")
+            }
+        }
+    })
+    
+    # Make labels unique
+    tax_labels <- make.unique(tax_labels, sep="_")
+    
+    # Create abundance data frame
+    abu_df <- as.data.frame(otu_mat)
+    colnames(abu_df) <- tax_labels
+    
+    # Add metadata
+    abu_df$Disease.status <- as.character(sample_data(ps_agg)$Disease.status)
+    abu_df$CellType <- factor(sample_data(ps_agg)$CellType, levels = c("Presort", "IGpos", "IGneg"))
+    
+    return(abu_df)
+}
+
+# Create output directories
+dir.create("plots", showWarnings = FALSE)
+dir.create("stats", showWarnings = FALSE)
+
+# Process each taxonomic level
+tax_levels <- c("Phylum", "Class", "Order", "Family", "Genus", "Species")
+all_stats <- data.frame()
+plot_list <- list()
+
+for(tax_level in tax_levels) {
+    cat(sprintf("\nProcessing %s level...\n", tax_level))
+    
+    # Get abundance data
+    abu_data <- get_level_abundances(ps_filtered_prev, tax_level)
+    
+    # Get top taxa
+    n_top <- if(tax_level %in% c("Phylum", "Class")) 10 else 20
+    taxa_cols <- setdiff(colnames(abu_data), c("Disease.status", "CellType"))
+    mean_abundance <- colMeans(abu_data[, taxa_cols])
+    top_taxa <- names(sort(mean_abundance, decreasing=TRUE))[1:min(n_top, length(mean_abundance))]
+    
+    # Create plotting data
+    plot_data <- abu_data %>%
+        dplyr::select(all_of(c(top_taxa, "Disease.status", "CellType"))) %>%
+        pivot_longer(cols = all_of(top_taxa),
+                    names_to = "Taxon",
+                    values_to = "Abundance")
+    
+    # Perform statistics
+    stats_results <- data.frame()
+    for(cell_type in levels(abu_data$CellType)) {  # Use levels to maintain order
+        for(taxon in top_taxa) {
+            cell_data <- abu_data[abu_data$CellType == cell_type, ]
+            
+            test <- wilcox.test(
+                cell_data[cell_data$Disease.status == "Control", taxon],
+                cell_data[cell_data$Disease.status == "Celiac", taxon],
+                exact = FALSE
+            )
+            
+            ctrl_vals <- cell_data[cell_data$Disease.status == "Control", taxon]
+            cel_vals <- cell_data[cell_data$Disease.status == "Celiac", taxon]
+            
+            stats_results <- rbind(stats_results, data.frame(
+                Level = tax_level,
+                CellType = cell_type,
+                Taxon = taxon,
+                p_value = test$p.value,
+                Control_median = median(ctrl_vals),
+                Celiac_median = median(cel_vals),
+                log2FoldChange = log2((median(cel_vals) + 1e-10)/(median(ctrl_vals) + 1e-10))
+            ))
+        }
+    }
+    
+    # Add FDR correction
+    stats_results$adj_p_value <- p.adjust(stats_results$p_value, method="BH")
+    stats_results$Significance <- ifelse(stats_results$adj_p_value < 0.001, "***",
+                                       ifelse(stats_results$adj_p_value < 0.01, "**",
+                                              ifelse(stats_results$adj_p_value < 0.05, "*", "ns")))
+    
+    all_stats <- rbind(all_stats, stats_results)
+    
+    # Create plots for each cell type
+    for(cell_type in levels(plot_data$CellType)) {  # Use levels to maintain order
+        # Filter data for this cell type
+        cell_data <- plot_data %>%
+            dplyr::filter(CellType == cell_type)
+        
+        # Get y-positions for annotations
+        y_positions <- cell_data %>%
+            dplyr::group_by(Taxon) %>%
+            dplyr::summarise(y_pos = max(Abundance) * 1.1)
+        
+        # Get significance values
+        sig_values <- stats_results %>%
+            dplyr::filter(CellType == cell_type) %>%
+            dplyr::select(Taxon, Significance)
+        
+        # Combine position and significance
+        annotations <- y_positions %>%
+            dplyr::left_join(sig_values, by = "Taxon")
+        
+        # Create plot
+        p <- ggplot(cell_data, aes(x = Disease.status, y = Abundance)) +
+            geom_violin(aes(fill = Disease.status), alpha = 0.7, trim = FALSE) +
+            geom_boxplot(width = 0.2, alpha = 0.7) +
+            geom_jitter(width = 0.2, size = 0.5, alpha = 0.5) +
+            facet_wrap(~Taxon, scales = "free_y", 
+                      ncol = if(tax_level %in% c("Phylum", "Class")) 3 else 4) +
+            scale_fill_manual(values = c("Control" = "#00AED7", "Celiac" = "#FD9347")) +
+            theme_bw() +
+            theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                  strip.text = element_text(size = 8),
+                  legend.position = "top",
+                  plot.title = element_text(size = 12, face = "bold"),
+                  axis.title = element_text(size = 10),
+                  panel.grid.minor = element_blank()) +
+            labs(title = paste(cell_type, "-", tax_level, "Level Distribution"),
+                 x = "Disease Status",
+                 y = "Relative Abundance (%)")
+        
+        # Add significance annotations
+        p <- p + geom_text(data = annotations,
+                          aes(x = 1.5, y = y_pos, label = Significance),
+                          size = 3,
+                          inherit.aes = FALSE)
+        
+        plot_list[[paste(cell_type, tax_level)]] <- p
+    }
+    
+    # Create combined plot for this level using the correct order
+    combined_plot <- plot_list[[paste("Presort", tax_level)]] / 
+                    plot_list[[paste("IGpos", tax_level)]] / 
+                    plot_list[[paste("IGneg", tax_level)]] +
+        plot_layout(guides = "collect") +
+        plot_annotation(
+            title = paste("Distribution at", tax_level, "Level"),
+            subtitle = "Mann-Whitney test significance: * p<0.05, ** p<0.01, *** p<0.001",
+            theme = theme(
+                plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+                plot.subtitle = element_text(size = 10, hjust = 0.5)
+            )
+        )
+    
+    # Save plot in plots directory
+    ggsave(file.path("plots", paste0("taxa_distributions_", tolower(tax_level), ".pdf")),
+           combined_plot,
+           width = 20,
+           height = 25,
+           dpi = 300)
+}
+
+# Save all statistics in stats directory
+write.csv(all_stats, 
+          file.path("stats", "taxonomic_analysis_all_levels.csv"), 
+          row.names = FALSE)
+
+# Print summary for each level
+for(tax_level in tax_levels) {
+    cat(sprintf("\nSummary for %s level:\n", tax_level))
+    
+    level_summary <- all_stats %>%
+        dplyr::filter(Level == tax_level, adj_p_value < 0.05) %>%
+        dplyr::group_by(CellType) %>%
+        dplyr::summarise(
+            Total_Significant = n(),
+            Increased_in_Celiac = sum(log2FoldChange > 0),
+            Decreased_in_Celiac = sum(log2FoldChange < 0)
+        )
+    
+    print(knitr::kable(level_summary))
+}
+```
+
+#Heatpmaps
+
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(tidyverse)
+library(phyloseq)
+# Function to create improved professional heatmap
+create_professional_heatmap <- function(data_list, cell_type, selected_taxa, stats, tax_level) {
+  # Input validation
+  if(length(selected_taxa) == 0) {
+    warning("No taxa met the selection criteria")
+    return(NULL)
+  }
+  
+  # Subset data
+  samples <- data_list$metadata$CellType == cell_type
+  
+  # Handle matrix subsetting properly
+  if(length(selected_taxa) == 1) {
+    abu_mat <- matrix(data_list$abundance[selected_taxa, samples],
+                      nrow = 1,
+                      dimnames = list(selected_taxa, 
+                                      colnames(data_list$abundance)[samples]))
+  } else {
+    abu_mat <- data_list$abundance[selected_taxa, samples, drop = FALSE]
+  }
+  
+  metadata <- data_list$metadata[samples, ]
+  
+  # Sort samples by Disease.status
+  col_order <- order(metadata$Disease.status)
+  abu_mat <- abu_mat[, col_order, drop = FALSE]
+  metadata <- metadata[col_order,]
+  
+  # Log transform abundances
+  abu_mat_log <- log2(abu_mat + 1)
+  
+  # Enhanced column annotations with borders
+  column_ha <- HeatmapAnnotation(
+    Group = metadata$Disease.status,
+    col = list(Group = c(Control = "#2C7BB6", Celiac = "#D7191C")),
+    show_legend = TRUE,
+    annotation_legend_param = list(
+      Group = list(
+        title = "Disease Status",
+        title_gp = gpar(fontsize = 10, fontface = "bold"),
+        labels_gp = gpar(fontsize = 9)
+      )
+    ),
+    border = TRUE,
+    gap = unit(1, "mm")
+  )
+  
+  # Calculate fold changes for row annotation
+  fold_changes <- sapply(rownames(abu_mat), function(taxon) {
+    log2((mean(abu_mat[taxon, metadata$Disease.status == "Celiac"]) + 0.01) /
+           (mean(abu_mat[taxon, metadata$Disease.status == "Control"]) + 0.01))
+  })
+  
+  # Enhanced row annotations with better color scales
+  row_ha <- rowAnnotation(
+    'log2FC' = fold_changes,
+    'p-value' = -log10(stats$p_value[match(rownames(abu_mat), stats$Taxon)]),
+    col = list(
+      'log2FC' = colorRamp2(
+        c(min(fold_changes), 0, max(fold_changes)), 
+        c("#2C7BB6", "white", "#D7191C")
+      ),
+      'p-value' = colorRamp2(
+        c(0, 2, 4), 
+        viridis(3, option = "D")
+      )
+    ),
+    annotation_name_gp = gpar(fontsize = 9, fontface = "bold"),
+    annotation_legend_param = list(
+      log2FC = list(
+        title = "log2(Fold Change)",
+        title_gp = gpar(fontsize = 10, fontface = "bold"),
+        labels_gp = gpar(fontsize = 9)
+      ),
+      'p-value' = list(
+        title = "-log10(p-value)",
+        title_gp = gpar(fontsize = 10, fontface = "bold"),
+        labels_gp = gpar(fontsize = 9)
+      )
+    ),
+    border = TRUE,
+    gap = unit(1, "mm")
+  )
+  
+  # Enhanced color mapping for abundance
+  max_val <- max(abu_mat_log)
+  abundance_colors <- colorRampPalette(
+    c("#313695", "#4575B4", "#74ADD1", "#ABD9E9", "#E0F3F8", 
+      "#FFFFBF", "#FEE090", "#FDAE61", "#F46D43", "#D73027", "#A50026")
+  )(100)
+  
+  col_fun <- colorRamp2(
+    seq(0, max_val, length.out = length(abundance_colors)),
+    abundance_colors
+  )
+  
+  # Sort rows by fold change
+  row_order <- order(fold_changes, decreasing = TRUE)
+  
+  # Create enhanced heatmap
+  ht <- Heatmap(
+    abu_mat_log,
+    name = "log2(Abundance + 1)",
+    col = col_fun,
+    
+    # Clustering settings
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    row_order = row_order,
+    
+    # Enhanced appearance
+    rect_gp = gpar(col = "white", lwd = 0.5),  # Add grid lines
+    show_row_names = TRUE,
+    show_column_names = FALSE,
+    row_names_gp = gpar(fontsize = 8),
+    column_title = paste(cell_type, "-", tax_level, "Level Differential Taxa"),
+    column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+    
+    # Legend enhancements
+    heatmap_legend_param = list(
+      title_gp = gpar(fontsize = 10, fontface = "bold"),
+      labels_gp = gpar(fontsize = 9),
+      legend_height = unit(4, "cm"),
+      title_position = "leftcenter-rot"
+    ),
+    
+    # Borders and spacing
+    border = TRUE,
+    border_gp = gpar(col = "black", lwd = 1.2),
+    
+    # Annotations
+    top_annotation = column_ha,
+    right_annotation = row_ha,
+    
+    # Additional formatting
+    use_raster = TRUE,
+    raster_quality = 4
+  )
+  
+  # Add padding and formatting to the overall plot
+  draw(ht, padding = unit(c(2, 2, 2, 2), "mm"),
+       heatmap_legend_side = "right",
+       annotation_legend_side = "right")
+  
+  return(ht)
+}
+
+# Process each taxonomic level
+tax_levels <- c("Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+for(tax_level in tax_levels) {
+  cat(sprintf("\nProcessing %s level...\n", tax_level))
+  
+  # Prepare data for this level
+  ps_rel <- transform_sample_counts(ps_filtered_prev, function(x) x/sum(x) * 100)
+  ps_level <- tax_glom(ps_rel, taxrank=tax_level, NArm=FALSE)
+  
+  # Extract abundance matrix
+  abu_mat <- as(phyloseq::otu_table(ps_level), "matrix")
+  if(!taxa_are_rows(ps_level)) {
+    abu_mat <- t(abu_mat)
+  }
+  
+  # Create proper taxa names
+  tax_mat <- as(phyloseq::tax_table(ps_level), "matrix")
+  taxa_names <- sapply(1:nrow(tax_mat), function(i) {
+    if(!is.na(tax_mat[i, tax_level])) {
+      if(tax_level == "Species") {
+        genus <- tax_mat[i, "Genus"]
+        species <- tax_mat[i, "Species"]
+        if(!is.na(genus)) {
+          return(paste(genus, species))
+        } else {
+          return(species)
+        }
+      } else {
+        return(tax_mat[i, tax_level])
+      }
+    } else {
+      prev_cols <- 1:which(colnames(tax_mat) == tax_level)
+      prev_level_idx <- max(which(!is.na(tax_mat[i, prev_cols])))
+      if(is.finite(prev_level_idx)) {
+        return(paste0("Unclassified_", tax_mat[i, prev_cols[prev_level_idx]]))
+      } else {
+        return("Unclassified")
+      }
+    }
+  })
+  
+  rownames(abu_mat) <- make.unique(taxa_names, sep="_")
+  
+  # Create data list
+  level_data <- list(
+    abundance = abu_mat,
+    taxonomy = tax_mat,
+    metadata = data.frame(sample_data(ps_level))
+  )
+  
+  # Process each cell type
+  for(cell_type in c("Presort", "IGpos", "IGneg")) {
+    cat(sprintf("  Analyzing %s...\n", cell_type))
+    
+    # Find striking taxa
+    striking_results <- find_striking_taxa(level_data$abundance, 
+                                           level_data$metadata,
+                                           cell_type)
+    
+    if(length(striking_results$selected_taxa) > 0) {
+      # Create output directory
+      dir.create("heatmaps", showWarnings = FALSE)
+      
+      # Create and save heatmap
+      ht <- create_professional_heatmap(level_data, 
+                                        cell_type,
+                                        striking_results$selected_taxa,
+                                        striking_results$statistics,
+                                        tax_level)
+      
+      if(!is.null(ht)) {
+        # Save heatmap with improved settings
+        pdf(paste0("heatmaps/", tolower(cell_type), "_", 
+                   tolower(tax_level), "_heatmap.pdf"),
+            width = 12,      # Increased width for better readability
+            height = 14,     # Increased height for better spacing
+            useDingbats = FALSE,  # Better PDF compatibility
+            family = "sans") # Use sans-serif font for better appearance
+        
+        # Draw heatmap with padding and proper legend placement
+        draw(ht, padding = unit(c(2, 2, 2, 2), "mm"),
+             heatmap_legend_side = "right",
+             annotation_legend_side = "right")
+        
+        dev.off()
+        
+        # Create PNG version for quick viewing
+        png(paste0("heatmaps/", tolower(cell_type), "_",
+                   tolower(tax_level), "_heatmap.png"),
+            width = 12, height = 14, units = "in", res = 300)
+        
+        draw(ht, padding = unit(c(2, 2, 2, 2), "mm"),
+             heatmap_legend_side = "right",
+             annotation_legend_side = "right")
+        
+        dev.off()
+      }
+      
+      # Save statistics
+      dir.create("statistics", showWarnings = FALSE)
+      write.csv(striking_results$statistics,
+                paste0("statistics/", tolower(cell_type), "_",
+                       tolower(tax_level), "_stats.csv"),
+                row.names = FALSE)
+      
+      # Print summary
+      cat(sprintf("\nSummary for %s - %s:\n", cell_type, tax_level))
+      print(striking_results$statistics %>%
+              dplyr::filter(adj_p_value < 0.05) %>%
+              dplyr::select(Taxon, fold_change, adj_p_value, mean_abundance) %>%
+              dplyr::arrange(adj_p_value) %>%
+              head(10))
+    }
+  }
+}
+
+# Create final summary
+cat("\nCreating final summary...\n")
+all_stats <- data.frame()
+
+for(tax_level in tax_levels) {
+  for(cell_type in c("Presort", "IGpos", "IGneg")) {
+    file_path <- paste0("statistics/", tolower(cell_type), "_",
+                        tolower(tax_level), "_stats.csv")
+    
+    if(file.exists(file_path)) {
+      stats <- read.csv(file_path)
+      stats$TaxonomicLevel <- tax_level
+      stats$CellType <- cell_type
+      all_stats <- rbind(all_stats, stats)
+    }
+  }
+}
+
+# Save comprehensive summary
+write.csv(all_stats %>%
+            dplyr::filter(adj_p_value < 0.05) %>%
+            dplyr::arrange(TaxonomicLevel, CellType, adj_p_value),
+          "statistics/significant_taxa_summary.csv",
+          row.names = FALSE)
+
+cat("\nAnalysis complete! Check 'heatmaps' and 'statistics' directories for results.\n")
+
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
