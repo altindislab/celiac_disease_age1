@@ -66,22 +66,16 @@ otu_matrix <- as.matrix(otuda)
 #psraw <- phyloseq::phyloseq(OTU, TAX, samples)
 library(phyloseq)
 
-
-# Print dimensions for debugging
-cat("Dimensions of otuda:", dim(otuda), "\n")
-cat("Dimensions of taxda before subsetting:", dim(taxda), "\n")
-
 # Ensure taxda only includes the taxa present in otuda
 taxda <- taxda[match(colnames(otuda), rownames(taxda)), ]
 
-# Check the dimensions again after subsetting
+# Check the dimensions after subsetting
 cat("Dimensions of taxda after subsetting:", dim(taxda), "\n")
 
 # Check if there are any NA values in row names after subsetting
 if (any(is.na(rownames(taxda)))) {
   stop("Some taxa in otuda were not found in taxda.")
 }
-
 
 # Convert taxda to matrix if not already done
 taxda <- as.matrix(taxda)
@@ -92,8 +86,6 @@ psraw <- phyloseq(
   sample_data(sampleda),
   phyloseq::tax_table(taxda)  # Use tax_table to create taxonomyTable directly
 )
-
-
 
 # Remove samples with low reads
 #psraw <- phyloseq::prune_samples(phyloseq::sample_sums(psraw) >= sort(rowSums(phyloseq::otu_table(psraw)))[2], psraw)
@@ -136,10 +128,6 @@ ps_rarefied <- rarefy_even_depth(ps_filtered_prev,
 print(ntaxa(ps_rarefied))
 
 ```
-
-
-
-\[Previous alpha diversity, taxonomic composition, and beta diversity analyses remain the same...\]
 
 # Differential Abundance Analysis with All Contrasts
 
