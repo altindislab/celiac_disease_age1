@@ -324,142 +324,440 @@ for (contrast_name in names(diff_abundance_results$results)) {
 ```
 
 ```{r}
-library(patchwork)
-library(tidyverse)
+### Alpha and Beta Diversity Presort
+
+# Load required libraries
+library(ggplot2)
+library(phyloseq)
 library(dplyr)
+library(vegan)
+library(patchwork)
 
-# Alpha Diversity Analysis
-
-##USE ps_filtered_prev in here!!
-# Calculate metrics
-alpha_div <- phyloseq::estimate_richness(ps_filtered_prev, measures=c("Observed", "Shannon", "Simpson"))
-alpha_div$CellType <- factor(gsub("(.+)_(.+)_.*", "\\1", sample_data(ps_filtered_prev)$Group),
-                            levels=c("Presort", "IGpos", "IGneg"))
-alpha_div$Disease.status <- factor(gsub("(.+)_(.+)_.*", "\\2", sample_data(ps_filtered_prev)$Group),
-                                 levels=c("Control", "Celiac"))
-
-# Function for statistical testing
-perform_stats <- function(data, metric) {
-    cell_types <- unique(data$CellType)
-    results <- data.frame()
-    
-    for(ct in cell_types) {
-        subset_data <- data[data$CellType == ct, ]
-        
-        # Get the metric values
-        metric_values <- subset_data[[metric]]
-        disease_status <- subset_data$Disease.status
-        
-        test <- wilcox.test(metric_values ~ disease_status, 
-                           exact=FALSE)
-        
-        # Calculate additional statistics
-        ctrl_values <- metric_values[disease_status == "Control"]
-        cel_values <- metric_values[disease_status == "Celiac"]
-        
-        results <- rbind(results, data.frame(
-            Metric = metric,
-            CellType = ct,
-            p_value = test$p.value,
-            Control_median = median(ctrl_values),
-            Control_IQR = paste(quantile(ctrl_values, 0.25), "-", quantile(ctrl_values, 0.75)),
-            Celiac_median = median(cel_values),
-            Celiac_IQR = paste(quantile(cel_values, 0.25), "-", quantile(cel_values, 0.75))
-        ))
-    }
-    return(results)
-}
-
-# Create plots and collect statistics
-plot_list <- list()
-all_stats <- data.frame()
-
-for(metric in c("Observed", "Shannon", "Simpson")) {
-    # Get statistical results
-    stat_results <- perform_stats(alpha_div, metric)
-    all_stats <- rbind(all_stats, stat_results)
-    
-    # Calculate y positions for annotations
-    y_positions <- alpha_div %>%
-        group_by(CellType) %>%
-        summarize(y_max = max(get(metric)) * 1.1)
-    
-    # Add FDR-corrected p-values
-    stat_results$adj_p_value <- p.adjust(stat_results$p_value, method="BH")
-    stat_results$significance <- ifelse(stat_results$adj_p_value < 0.001, "***",
-                                      ifelse(stat_results$adj_p_value < 0.01, "**",
-                                             ifelse(stat_results$adj_p_value < 0.05, "*", "ns")))
-    
-    # Create plot
-    p <- ggplot(alpha_div, aes(x = Disease.status, 
-                              y = .data[[metric]], 
-                              fill = Disease.status)) +
-        geom_violin(alpha = 0.7) +
-        geom_boxplot(width = 0.2, alpha = 0.7) +
-        geom_jitter(width = 0.2, size = 1, alpha = 0.6) +
-        facet_wrap(~CellType, ncol = 1) +
-        scale_fill_manual(values = c("Control" = "#00AED7", 
-                                   "Celiac" = "#FD9347")) +
-        theme_bw() +
-        theme(panel.grid.minor = element_blank(),
-              plot.title = element_text(size = 10, face = "bold"),
-              strip.background = element_rect(fill = "white"),
-              strip.text = element_text(face = "bold"),
-              legend.position = "none",
-              axis.title.x = element_blank()) +
-        labs(y = metric)
-    
-    # Add significance annotations
-    annotation_data <- merge(stat_results, y_positions)
-    
-    p <- p + geom_text(data = annotation_data,
-                       aes(x = 1.5, 
-                           y = y_max,
-                           label = significance),
-                       inherit.aes = FALSE,
-                       size = 3)
-    
-    plot_list[[metric]] <- p
-}
-
-# Combine plots side by side
-combined_plot <- plot_list$Observed + plot_list$Shannon + plot_list$Simpson +
-    plot_layout(ncol = 3) +
-    plot_annotation(
-        title = "Alpha Diversity Analysis",
-        subtitle = "Control vs Celiac comparison by cell type",
-        theme = theme(
-            plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
-            plot.subtitle = element_text(size = 10, hjust = 0.5)
-        )
+# Function to create alpha diversity plot
+create_alpha_plot <- function(ps_obj) {
+  # Calculate alpha diversity metrics
+  alpha_div <- estimate_richness(ps_obj, measures = "Observed")
+  
+  # Add metadata information
+  alpha_div$Disease.status <- sample_data(ps_obj)$Disease.status
+  alpha_div$Disease.status <- factor(alpha_div$Disease.status, levels = c("Control", "Celiac"))
+  
+  # Create the box plot
+  p <- ggplot(alpha_div, aes(x = Disease.status, y = Observed, fill = Disease.status)) +
+    geom_boxplot(outlier.shape = 19, outlier.size = 1.5) +
+    scale_fill_manual(values = c("Control" = "#00AED7", "Celiac" = "#FD9347")) +
+    labs(
+      title = "Observed ASV",
+      y = "Alpha Diversity\n(ASV)",
+      x = ""
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 12, face = "bold", hjust = 0),
+      axis.text = element_text(size = 10),
+      axis.title = element_text(size = 11)
     )
+  
+  # Perform statistical test
+  stat_test <- wilcox.test(Observed ~ Disease.status, data = alpha_div, exact = FALSE)
+  
+  # Add p-value annotation if significant
+  if (stat_test$p.value < 0.05) {
+    sig_symbol <- if(stat_test$p.value < 0.001) "***"
+    else if(stat_test$p.value < 0.01) "**"
+    else "*"
+    
+    y_pos <- max(alpha_div$Observed) * 1.1
+    p <- p + 
+      geom_segment(aes(x = 1, xend = 2, y = y_pos, yend = y_pos)) +
+      geom_text(aes(x = 1.5, y = y_pos * 1.05), label = sig_symbol)
+  }
+  
+  return(list(plot = p, statistics = data.frame(
+    test = "Wilcoxon",
+    statistic = stat_test$statistic,
+    p_value = stat_test$p.value
+  )))
+}
 
-# Save combined plot
-ggsave("alpha_diversity_all_metrics.pdf", 
-       combined_plot, 
-       width = 12, 
-       height = 8, 
-       dpi = 300)
+# Function to create Bray-Curtis analysis with PERMANOVA
+create_beta_analysis <- function(ps_obj) {
+  # Calculate Bray-Curtis distances
+  bc_dist <- phyloseq::distance(ps_obj, method = "bray")
+  
+  # Get metadata
+  meta <- data.frame(sample_data(ps_obj))
+  
+  # Perform PERMANOVA
+  permanova_result <- adonis2(bc_dist ~ Disease.status, data = meta, permutations = 999)
+  
+  # Create distance matrix
+  dist_matrix <- as.matrix(bc_dist)
+  
+  # Function to extract between-group distances
+  get_between_group_distances <- function(dist_matrix, meta) {
+    distances <- data.frame(
+      Distance = numeric(),
+      Disease.status = character()
+    )
+    
+    # Get distances within Control group
+    control_samples <- rownames(meta)[meta$Disease.status == "Control"]
+    if(length(control_samples) >= 2) {
+      control_dist <- dist_matrix[control_samples, control_samples]
+      control_dist <- control_dist[upper.tri(control_dist)]
+      distances <- rbind(distances, 
+                         data.frame(Distance = control_dist,
+                                    Disease.status = "Control"))
+    }
+    
+    # Get distances within Celiac group
+    celiac_samples <- rownames(meta)[meta$Disease.status == "Celiac"]
+    if(length(celiac_samples) >= 2) {
+      celiac_dist <- dist_matrix[celiac_samples, celiac_samples]
+      celiac_dist <- celiac_dist[upper.tri(celiac_dist)]
+      distances <- rbind(distances, 
+                         data.frame(Distance = celiac_dist,
+                                    Disease.status = "Celiac"))
+    }
+    
+    distances$Disease.status <- factor(distances$Disease.status, 
+                                       levels = c("Control", "Celiac"))
+    return(distances)
+  }
+  
+  # Get distances
+  bc_distances <- get_between_group_distances(dist_matrix, meta)
+  
+  # Create box plot
+  p <- ggplot(bc_distances, aes(x = Disease.status, y = Distance, fill = Disease.status)) +
+    geom_boxplot(outlier.shape = 19, outlier.size = 1.5) +
+    scale_fill_manual(values = c("Control" = "#00AED7", "Celiac" = "#FD9347")) +
+    labs(
+      title = "Bray-Curtis Dissimilarity",
+      subtitle = sprintf("PERMANOVA R² = %.3f, p = %.3f", 
+                         permanova_result$R2[1], 
+                         permanova_result$`Pr(>F)`[1]),
+      y = "Distance",
+      x = ""
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 12, face = "bold", hjust = 0),
+      plot.subtitle = element_text(size = 10, hjust = 0),
+      axis.text = element_text(size = 10),
+      axis.title = element_text(size = 11)
+    )
+  
+  # Perform within-group statistical test
+  stat_test <- wilcox.test(Distance ~ Disease.status, data = bc_distances, exact = FALSE)
+  
+  # Add p-value annotation if significant
+  if (stat_test$p.value < 0.05) {
+    sig_symbol <- if(stat_test$p.value < 0.001) "***"
+    else if(stat_test$p.value < 0.01) "**"
+    else "*"
+    
+    y_pos <- max(bc_distances$Distance) * 1.1
+    p <- p + 
+      geom_segment(aes(x = 1, xend = 2, y = y_pos, yend = y_pos)) +
+      geom_text(aes(x = 1.5, y = y_pos * 1.05), label = sig_symbol)
+  }
+  
+  # Test for homogeneity of dispersion
+  disp <- betadisper(bc_dist, meta$Disease.status)
+  disp_test <- permutest(disp, permutations = 999)
+  
+  return(list(
+    plot = p,
+    statistics = list(
+      permanova = permanova_result,
+      within_group_test = data.frame(
+        test = "Wilcoxon",
+        statistic = stat_test$statistic,
+        p_value = stat_test$p.value
+      ),
+      dispersion_test = disp_test
+    )
+  ))
+}
 
-# Process statistics for output
-all_stats <- all_stats %>%
-    mutate(adj_p_value = p.adjust(p_value, method="BH")) %>%
-    mutate(Significance = ifelse(adj_p_value < 0.001, "***",
-                                ifelse(adj_p_value < 0.01, "**",
-                                       ifelse(adj_p_value < 0.05, "*", "ns")))) %>%
-    arrange(Metric, CellType) %>%
-    dplyr::select(Metric, CellType, 
-           Control_median, Control_IQR,
-           Celiac_median, Celiac_IQR,
-           p_value, adj_p_value, Significance)
+# Create both analyses
+alpha_results <- create_alpha_plot(ps_filtered_prev)
+beta_results <- create_beta_analysis(ps_filtered_prev)
 
-# Save comprehensive statistics
-write.csv(all_stats, "alpha_diversity_complete_statistics.csv", row.names = FALSE)
+# Combine plots vertically
+combined_plot <- alpha_results$plot / beta_results$plot +
+  plot_layout(heights = c(1, 1))
 
-# Print summary table
-print(knitr::kable(all_stats, 
-                   digits = 3,
-                   caption = "Complete Alpha Diversity Statistics"))
+# Save the combined plot
+ggsave("alpha_beta_diversity_boxplots.pdf", combined_plot, width = 6, height = 8, dpi = 300)
+
+# Save individual plots
+ggsave("alpha_diversity_boxplot.pdf", alpha_results$plot, width = 6, height = 4, dpi = 300)
+ggsave("beta_diversity_boxplot.pdf", beta_results$plot, width = 6, height = 4, dpi = 300)
+
+# Save statistical results
+statistical_summary <- list(
+  alpha_diversity = alpha_results$statistics,
+  beta_diversity = beta_results$statistics
+)
+
+# Write statistical results to a file
+sink("diversity_analysis_statistics.txt")
+cat("Alpha Diversity Analysis:\n")
+print(alpha_results$statistics)
+cat("\nBeta Diversity Analysis:\n")
+cat("\nPERMANOVA Results:\n")
+print(beta_results$statistics$permanova)
+cat("\nWithin-group Distance Test:\n")
+print(beta_results$statistics$within_group_test)
+cat("\nDispersion Homogeneity Test:\n")
+print(beta_results$statistics$dispersion_test)
+sink()
+
+
+### Alpha and Beta Diversity Post Sort
+
+# Load required libraries
+library(ggplot2)
+library(phyloseq)
+library(dplyr)
+library(vegan)
+library(patchwork)
+
+#' Create Alpha Diversity Plot
+#'
+#' @param ps_obj Phyloseq object containing the microbiome data
+#' @param sort_type Character string specifying the sort type (IGneg or IGpos)
+#' @return List containing plot object and statistical results
+#' @details Creates box plots of alpha diversity metrics and performs statistical tests
+create_alpha_plot <- function(ps_obj, sort_type) {
+  # Filter for specific sort type
+  ps_subset <- subset_samples(ps_obj, Sort %in% sort_type)
+  
+  # Calculate alpha diversity metrics
+  alpha_div <- estimate_richness(ps_subset, measures = c("Observed", "Shannon", "Simpson"))
+  
+  # Add metadata information
+  alpha_div$Disease.status <- sample_data(ps_subset)$Disease.status
+  alpha_div$Sort <- sample_data(ps_subset)$Sort
+  alpha_div$Disease.status <- factor(alpha_div$Disease.status, levels = c("Control", "Celiac"))
+  
+  # Create the box plot with consistent color scheme
+  p <- ggplot(alpha_div, aes(x = Disease.status, y = Observed, fill = Disease.status)) +
+    geom_boxplot(outlier.shape = 19, outlier.size = 1.5) +
+    geom_jitter(width = 0.2, alpha = 0.5) +  # Add individual points
+    scale_fill_manual(values = c("Control" = "#00AED7", "Celiac" = "#FD9347")) +
+    labs(
+      title = paste("Observed ASV -", sort_type),
+      y = "Alpha Diversity\n(ASV)",
+      x = ""
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 12, face = "bold", hjust = 0),
+      axis.text = element_text(size = 10),
+      axis.title = element_text(size = 11)
+    )
+  
+  # Perform statistical tests for each diversity measure
+  measures <- c("Observed", "Shannon", "Simpson")
+  stats_results <- data.frame()
+  
+  for(measure in measures) {
+    # Wilcoxon test
+    test <- wilcox.test(alpha_div[[measure]] ~ alpha_div$Disease.status, exact = FALSE)
+    
+    # Calculate effect size (Cliff's Delta)
+    control_vals <- alpha_div[[measure]][alpha_div$Disease.status == "Control"]
+    celiac_vals <- alpha_div[[measure]][alpha_div$Disease.status == "Celiac"]
+    
+    n1 <- length(control_vals)
+    n2 <- length(celiac_vals)
+    dominance <- sum(outer(control_vals, celiac_vals, ">")) - 
+      sum(outer(control_vals, celiac_vals, "<"))
+    cliff_delta <- dominance / (n1 * n2)
+    
+    stats_results <- rbind(stats_results, data.frame(
+      sort_type = sort_type,
+      measure = measure,
+      statistic = test$statistic,
+      p_value = test$p.value,
+      cliff_delta = cliff_delta,
+      control_mean = mean(control_vals),
+      control_sd = sd(control_vals),
+      celiac_mean = mean(celiac_vals),
+      celiac_sd = sd(celiac_vals)
+    ))
+  }
+  
+  # Save statistical test results
+  write.csv(stats_results, 
+            paste0("alpha_diversity_statistics_", sort_type, ".csv"), 
+            row.names = FALSE)
+  
+  # Add p-value annotation if significant
+  if (stats_results$p_value[1] < 0.05) {  # For Observed diversity
+    sig_symbol <- if(stats_results$p_value[1] < 0.001) "***"
+    else if(stats_results$p_value[1] < 0.01) "**"
+    else "*"
+    
+    y_pos <- max(alpha_div$Observed) * 1.1
+    p <- p + 
+      geom_segment(aes(x = 1, xend = 2, y = y_pos, yend = y_pos)) +
+      geom_text(aes(x = 1.5, y = y_pos * 1.05), 
+                label = sig_symbol)
+  }
+  
+  return(list(plot = p, stats = stats_results))
+}
+
+#' Create Bray-Curtis Analysis
+#'
+#' @param ps_obj Phyloseq object containing the microbiome data
+#' @param sort_type Character string specifying the sort type (IGneg or IGpos)
+#' @return List containing plot object and statistical results
+#' @details Performs beta diversity analysis using Bray-Curtis dissimilarity
+create_bray_curtis_analysis <- function(ps_obj, sort_type) {
+  # Filter for specific sort type
+  ps_subset <- subset_samples(ps_obj, Sort %in% sort_type)
+  
+  # Calculate Bray-Curtis distances
+  bc_dist <- phyloseq::distance(ps_subset, method = "bray")
+  
+  # Get metadata
+  meta <- data.frame(sample_data(ps_subset))
+  
+  # Perform PERMANOVA
+  permanova_result <- adonis2(bc_dist ~ Disease.status, data = meta, permutations = 999)
+  
+  # Perform betadisper test for homogeneity of dispersion
+  beta_disper <- betadisper(bc_dist, meta$Disease.status)
+  disper_test <- permutest(beta_disper, permutations = 999)
+  
+  # Extract within-group and between-group distances
+  dist_matrix <- as.matrix(bc_dist)
+  
+  # Calculate within-group distances
+  control_samples <- meta$Disease.status == "Control"
+  celiac_samples <- meta$Disease.status == "Celiac"
+  
+  within_control <- dist_matrix[control_samples, control_samples][upper.tri(dist_matrix[control_samples, control_samples])]
+  within_celiac <- dist_matrix[celiac_samples, celiac_samples][upper.tri(dist_matrix[celiac_samples, celiac_samples])]
+  between_groups <- dist_matrix[control_samples, celiac_samples]
+  
+  # Prepare data for plotting
+  plot_data <- data.frame(
+    Distance = c(within_control, within_celiac),
+    Group = factor(c(rep("Control", length(within_control)),
+                     rep("Celiac", length(within_celiac))),
+                   levels = c("Control", "Celiac"))
+  )
+  
+  # Create box plot
+  p <- ggplot(plot_data, aes(x = Group, y = Distance, fill = Group)) +
+    geom_boxplot(outlier.shape = 19, outlier.size = 1.5) +
+    geom_jitter(width = 0.2, alpha = 0.5) +
+    scale_fill_manual(values = c("Control" = "#00AED7", "Celiac" = "#FD9347")) +
+    labs(
+      title = paste("Bray-Curtis Dissimilarity -", sort_type),
+      subtitle = paste("PERMANOVA R² =", round(permanova_result$R2[1], 3),
+                       ", p =", format(permanova_result$`Pr(>F)`[1], digits = 3)),
+      y = "Distance",
+      x = ""
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(size = 12, face = "bold", hjust = 0),
+      plot.subtitle = element_text(size = 10, hjust = 0),
+      axis.text = element_text(size = 10),
+      axis.title = element_text(size = 11)
+    )
+  
+  # Save statistical results
+  stats_results <- data.frame(
+    sort_type = sort_type,
+    test = c("PERMANOVA", "Dispersion"),
+    statistic = c(permanova_result$F[1], disper_test$F[1]),
+    R2 = c(permanova_result$R2[1], NA),
+    p_value = c(permanova_result$`Pr(>F)`[1], disper_test$tab$`Pr(>F)`[1])
+  )
+  
+  write.csv(stats_results,
+            paste0("beta_diversity_statistics_", sort_type, ".csv"),
+            row.names = FALSE)
+  
+  return(list(plot = p, stats = stats_results))
+}
+
+# Main analysis workflow
+sort_types <- c("IGneg", "IGpos")
+all_results <- list()
+
+# Process each sort type
+for (sort_type in sort_types) {
+  # Run analyses
+  alpha_results <- create_alpha_plot(ps_filtered_prev, sort_type)
+  beta_results <- create_bray_curtis_analysis(ps_filtered_prev, sort_type)
+  
+  # Store results
+  all_results[[sort_type]] <- list(
+    alpha = alpha_results,
+    beta = beta_results
+  )
+  
+  # Create combined plot for this sort type
+  combined_plot <- alpha_results$plot / beta_results$plot +
+    plot_layout(heights = c(1, 1))
+  
+  # Save plots
+  ggsave(
+    paste0("diversity_analysis_", sort_type, ".pdf"),
+    combined_plot,
+    width = 6,
+    height = 8,
+    dpi = 300
+  )
+}
+
+# Create final combined figure
+combined_figure <- (all_results$IGneg$alpha$plot + all_results$IGpos$alpha$plot) /
+  (all_results$IGneg$beta$plot + all_results$IGpos$beta$plot) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Diversity Analyses by Sort Type",
+    theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+  )
+
+# Save combined figure
+ggsave(
+  "all_diversity_analyses.pdf",
+  combined_figure,
+  width = 12,
+  height = 10,
+  dpi = 300
+)
+
+# Create comprehensive statistical summary
+alpha_stats <- do.call(rbind, lapply(all_results, function(x) x$alpha$stats))
+beta_stats <- do.call(rbind, lapply(all_results, function(x) x$beta$stats))
+
+write.csv(alpha_stats, "alpha_diversity_statistics_summary.csv", row.names = FALSE)
+write.csv(beta_stats, "beta_diversity_statistics_summary.csv", row.names = FALSE)
+
 ```
 
 ```{r}
