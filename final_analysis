@@ -1464,9 +1464,595 @@ write.csv(do.call(rbind, lapply(names(all_permanova), function(name) {
   )
 })), "all_permanova_results.csv")
 
+```
+
+### LEFSE ANALYSIS
+```{r}
+# Load required libraries
+suppressPackageStartupMessages({
+  library(phyloseq)
+  library(MicrobiotaProcess)
+  library(tidyverse)
+  library(ggplot2)
+  library(gridExtra)
+})
+
+# Set up color scheme
+group_colors <- c(
+  "Control" = "#00AED7",
+  "Celiac" = "#FD9347"
+)
+
+# Create output directories
+dir.create("lefse_results", showWarnings = FALSE)
+dir.create("lefse_plots", showWarnings = FALSE)
+
+# Process each cell type
+cell_types <- c("Presort", "IGpos", "IGneg")
+
+# Initialize an empty list to store results
+all_cell_results <- list()
+
+# Function to process differential analysis results
+process_diff_analysis <- function(deres, cell_type) {
+  if (!is.null(deres) && nrow(data.frame(deres)) > 0) {
+    # Convert deres to data frame and add cell type
+    diff_table <- data.frame(deres)
+    diff_table$CellType <- cell_type
+    
+    # Create differential abundance boxplot
+    tryCatch({
+      p1 <- ggdiffbox(deres, 
+                      box_notch = FALSE) +
+        scale_fill_manual(values = group_colors) +
+        scale_color_manual(values = group_colors) +
+        theme_bw() +
+        labs(title = paste(cell_type, "- Differential Features")) +
+        theme(axis.text.y = element_text(size = 8))
+      
+      ggsave(paste0("lefse_plots/", tolower(cell_type), "_diffbox.pdf"),
+             p1, width = 10, height = 8)
+    }, error = function(e) {
+      warning(sprintf("Error creating boxplot for %s: %s", cell_type, e$message))
+    })
+    
+    # Create cladogram
+    tryCatch({
+      p2 <- ggdiffclade(deres, 
+                        alpha = 0.3,
+                        linewd = 0.15,
+                        skpointsize = 0.6,
+                        layout = "radial",
+                        taxlevel = 3,
+                        removeUnknown = TRUE,
+                        reduce = TRUE) +
+        scale_fill_manual(values = group_colors) +
+        scale_color_manual(values = group_colors)
+      
+      ggsave(paste0("lefse_plots/", tolower(cell_type), "_cladogram.pdf"),
+             p2, width = 12, height = 12)
+    }, error = function(e) {
+      warning(sprintf("Error creating cladogram for %s: %s", cell_type, e$message))
+    })
+    
+    return(diff_table)
+  }
+  return(NULL)
+}
+
+# Main analysis loop
+for (cell_type in cell_types) {
+  cat(sprintf("\nProcessing differential analysis for %s...\n", cell_type))
+  
+  # Subset data for cell type
+  ps_subset <- tryCatch({
+    subset_samples(ps_rel, CellType == cell_type)
+  }, error = function(e) {
+    cat(sprintf("Error subsetting data for %s: %s\n", cell_type, e$message))
+    return(NULL)
+  })
+  
+  if (is.null(ps_subset)) next
+  
+  # Run differential analysis
+  deres <- tryCatch({
+    diff_analysis(ps_subset, 
+                  classgroup = "Disease.status",
+                  mlfun = "lda",
+                  filtermod = "pvalue",
+                  firstcomfun = "kruskal_test",
+                  firstalpha = 0.05,
+                  strictmod = FALSE,
+                  secondcomfun = "wilcox_test",
+                  subclmin = 3,
+                  subclwilc = FALSE,
+                  secondalpha = 0.05,
+                  lda = 2)
+  }, error = function(e) {
+    cat(sprintf("Error in differential analysis for %s: %s\n", cell_type, e$message))
+    return(NULL)
+  })
+  
+  # Process results
+  if (!is.null(deres)) {
+    results <- process_diff_analysis(deres, cell_type)
+    if (!is.null(results)) {
+      all_cell_results[[cell_type]] <- results
+      
+      # Save individual results
+      saveRDS(deres, file = paste0("lefse_results/", tolower(cell_type), "_lefse_results.rds"))
+      write.csv(results,
+                paste0("lefse_results/", tolower(cell_type), "_results.csv"),
+                row.names = FALSE)
+    }
+  } else {
+    cat(sprintf("No significant results found for %s\n", cell_type))
+  }
+}
+
+# Process combined results
+if (length(all_cell_results) > 0) {
+  # Combine all results into one dataframe
+  all_results <- bind_rows(all_cell_results)
+  
+  # Save combined summary
+  write.csv(all_results,
+            "lefse_results/combined_lefse_summary.csv",
+            row.names = FALSE)
+  
+  # Print available columns
+  cat("\nAvailable columns in the dataset:\n")
+  print(names(all_results))
+  
+  # Create summary statistics
+  summary_table <- all_results %>%
+    group_by(CellType) %>%
+    summarise(
+      Total_Features = n(),
+      Features_in_Control = sum(Disease.status == "Control", na.rm = TRUE),
+      Features_in_Celiac = sum(Disease.status == "Celiac", na.rm = TRUE),
+      Mean_LDA_Score = mean(LDAmean, na.rm = TRUE),
+      Mean_FDR = mean(fdr, na.rm = TRUE)
+    )
+  
+  # Save summary statistics
+  write.csv(summary_table,
+            "lefse_results/summary_statistics.csv",
+            row.names = FALSE)
+  
+  # Print top features for each cell type
+  cat("\nTop features by LDA score for each cell type:\n")
+  for (ct in unique(all_results$CellType)) {
+    cat(sprintf("\n%s:\n", ct))
+    
+    tryCatch({
+      # Filter for this cell type
+      ct_data <- all_results %>%
+        filter(CellType == ct) %>%
+        arrange(desc(abs(LDAmean)))
+      
+      # Select columns that exist
+      cols_to_select <- c("f", "Disease.status", "LDAmean", "pvalue", "fdr")
+      cols_present <- intersect(cols_to_select, names(ct_data))
+      
+      # Select top 10 features
+      top_features <- ct_data %>%
+        select(!!!syms(cols_present)) %>%
+        head(10)
+      
+      if(nrow(top_features) > 0) {
+        # Format the output for better readability
+        formatted_features <- top_features %>%
+          mutate(
+            LDAmean = round(LDAmean, 3),
+            pvalue = format.pval(pvalue, digits = 3),
+            fdr = format.pval(fdr, digits = 3)
+          )
+        
+        print(formatted_features)
+      } else {
+        cat("No features found.\n")
+      }
+    }, error = function(e) {
+      cat(sprintf("Error processing top features for %s: %s\n", ct, e$message))
+    })
+  }
+  
+  # Create visualization plots
+  tryCatch({
+    # Summary plot
+    summary_plot <- ggplot(all_results, 
+                           aes(x = reorder(f, LDAmean),
+                               y = LDAmean,
+                               fill = Disease.status)) +
+      geom_bar(stat = "identity") +
+      facet_wrap(~CellType, scales = "free_y") +
+      coord_flip() +
+      theme_bw() +
+      theme(axis.text.y = element_text(size = 8)) +
+      labs(x = "Features",
+           y = "LDA Score",
+           title = "Differential Analysis Summary",
+           fill = "Disease Status") +
+      scale_fill_manual(values = group_colors)
+    
+    ggsave("lefse_plots/combined_summary.pdf", 
+           summary_plot, width = 12, height = 8)
+    
+    # Volcano plots for each cell type
+    for (ct in unique(all_results$CellType)) {
+      p_volcano <- all_results %>%
+        filter(CellType == ct) %>%
+        ggplot(aes(x = LDAmean, y = -log10(fdr))) +
+        geom_point(aes(color = Disease.status), alpha = 0.6) +
+        geom_vline(xintercept = 0, linetype = "dashed") +
+        geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+        scale_color_manual(values = group_colors) +
+        theme_bw() +
+        labs(title = paste(ct, "- Volcano Plot"),
+             x = "LDA Score",
+             y = "-log10(FDR)")
+      
+      ggsave(paste0("lefse_plots/", tolower(ct), "_volcano.pdf"),
+             p_volcano, width = 8, height = 6)
+    }
+    
+    # FDR distribution plot
+    p_fdr <- ggplot(all_results, aes(x = fdr, fill = Disease.status)) +
+      geom_histogram(position = "dodge", bins = 30, alpha = 0.7) +
+      facet_wrap(~CellType) +
+      scale_fill_manual(values = group_colors) +
+      theme_bw() +
+      labs(title = "FDR Distribution",
+           x = "FDR",
+           y = "Count")
+    
+    ggsave("lefse_plots/fdr_distribution.pdf", 
+           p_fdr, width = 10, height = 6)
+    
+  }, error = function(e) {
+    cat(sprintf("Error creating visualization plots: %s\n", e$message))
+  })
+  
+  # Print statistical insights
+  cat("\nStatistical Insights:\n")
+  for (ct in unique(all_results$CellType)) {
+    cat(sprintf("\n%s:\n", ct))
+    
+    # Get subset for this cell type
+    ct_data <- all_results %>%
+      filter(CellType == ct)
+    
+    # Number of significant features (with more detailed info)
+    sig_features <- ct_data %>%
+      filter(fdr < 0.05) %>%
+      nrow()
+    
+    # Mean LDA score
+    mean_lda <- mean(abs(ct_data$LDAmean), na.rm = TRUE)
+    
+    # Distribution between groups for significant features
+    sig_dist <- ct_data %>%
+      filter(fdr < 0.05) %>%
+      count(Disease.status) %>%
+      spread(Disease.status, n, fill = 0)
+    
+    cat(sprintf("- Significant features (FDR < 0.05): %d\n", sig_features))
+    cat(sprintf("- Mean absolute LDA score: %.2f\n", mean_lda))
+    cat("- Distribution of significant features:\n")
+    if(nrow(sig_dist) > 0) {
+      print(sig_dist)
+    } else {
+      cat("  No significant features found\n")
+    }
+    
+    # Add additional statistics
+    cat("\nTop 5 features by LDA score:\n")
+    ct_data %>%
+      arrange(desc(abs(LDAmean))) %>%
+      select(f, LDAmean, pvalue, fdr) %>%
+      head(5) %>%
+      mutate(across(where(is.numeric), round, 3)) %>%
+      print()
+  }
+} else {
+  cat("\nNo results were generated for any cell type.\n")
+}
+
+cat("\nDifferential analysis complete. Results are saved in 'lefse_results' and 'lefse_plots' directories.\n")
+
+```
+
+### PICRUST ANALYSIS
+```{r}
+# Install if BiocManager is not present
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+# Install required packages if they are not already installed
+if (!require("dada2")) BiocManager::install("dada2")
+if (!require("tidyverse")) install.packages("tidyverse")
+if (!require("limma")) BiocManager::install("limma")
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("dplyr")) install.packages("dplyr")
+
+# Load required libraries
+library(dada2)
+library(tidyverse)
+library(limma)
+library(ggplot2)
+library(dplyr)
+
+# Set working directory 
+setwd("D:/CD/picrust_general_folder")
+
+# Load custom functions
+source("D:/CD/picrust_general_folder/fcns/fcns_limma/limma_contrasts.r")
+source("D:/CD/picrust_general_folder/fcns/fcns_limma/multiTopTab.r")
+source("D:/CD/picrust_general_folder/fcns/fcns_limma/my_toptab.r")
+source("D:/CD/picrust_general_folder/fcns/fcns_limma/logfc2fc.r")
+source("D:/CD/picrust_general_folder/fcns/ezheat.r")
+source("D:/CD/picrust_general_folder/fcns/prune_mat.r")
+
+# Read metadata
+md <- read.csv("data/CeD new label (2).csv")
+md_age <- read.csv("data/Celiakibarn 190906.csv")
+md <- merge(md, md_age, all = TRUE)
+rm(md_age)
+
+# Process metadata
+md <- md[order(md$New.Sample.ID), ]
+md <- md[rep(1:nrow(md), each = 3),]
+md$New.Sample.ID <- paste0("S", md$New.Sample.ID, c("", ".neg", ".pos"))
+md$Sort <- rep(c("Presort", "IGneg", "IGpos"), time = nrow(md)/3)
+md$Disease.status <- sapply(md$Disease.status, FUN = switch, A = "Celiac", B = "Control")
+md$ABIS.no <- paste0("ABIS", md$ABIS.no)
+
+# Factor setup
+md$Disease.status <- factor(md$Disease.status, levels = c("Control", "Celiac"))
+md$Sorted <- md$Sort <- factor(md$Sort, levels = c("Presort", "IGneg", "IGpos"))
+levels(md$Sorted) <- list(Presort = "Presort", Postsort = c("IGneg", "IGpos"))
+md <- md[order(md$Sort, md$Disease.status, md$Age, md$ABIS.no), ]
+md$Group <- paste(md$Sort, md$Disease.status, md$Age, sep = "_")
+md$Group <- factor(md$Group, levels = unique(md$Group))
+md$Age <- factor(paste0(md$Age, "year"))
+md <- data.frame(md, row.names = "New.Sample.ID")
+
+# Read pathway data
+pwys.tab <- read.delim("KEGG_pathways_out/path_abun_unstrat.tsv.gz", row.names = 1)
+grp <- gsub("\\.[1-2]$", "", gsub("\\.[1-2]\\.", ".", colnames(pwys.tab)))
+pwys.tab <- t(rowsum(t(pwys.tab), group = grp))
+rm(grp)
+
+# Match samples
+nms <- intersect(rownames(md), colnames(pwys.tab))
+pwys.tab <- pwys.tab[, nms]
+md <- md[nms, ]
+
+# Read pathway annotations
+annot <- read.delim("annotations/kegg/pathway_id/KEGG_pathways_info.tsv.gz", row.names = 1, header = FALSE)
+colnames(annot) <- "Pathway"
+
+# Filter and transform data
+pwys.tab <- pwys.tab[rowSums(pwys.tab >= 10) > 5, ]
+pwys.tab <- log2(pwys.tab + 1)
+
+# Create diagnostic plots
+pdf("diagnostic_plots.pdf")
+boxplot(pwys.tab, main="Boxplot of pathway abundances")
+hist(pwys.tab, main="Histogram of pathway abundances")
+dev.off()
+
+# Save processed data
+save(pwys.tab, md, annot, file = "kegg_pwys.rda")
+
+# Define contrasts
+contr.v <- c(
+  Celiac_vs_Control_in_Presort_Age1 = "Presort_Celiac_1 - Presort_Control_1",
+  Celiac_vs_Control_in_IGneg_Age1 = "IGneg_Celiac_1 - IGneg_Control_1",
+  Celiac_vs_Control_in_IGpos_Age1 = "IGpos_Celiac_1 - IGpos_Control_1", 
+  IGpos_vs_IGneg_in_Control_Age1 = "IGpos_Control_1 - IGneg_Control_1",  
+  IGpos_vs_IGneg_in_Celiac_Age1 = "IGpos_Celiac_1 - IGneg_Celiac_1",
+  
+  Celiac_vs_Control_in_Presort_Age2.5 = "Presort_Celiac_2.5 - Presort_Control_2.5",
+  Celiac_vs_Control_in_IGneg_Age2.5 = "IGneg_Celiac_2.5 - IGneg_Control_2.5",
+  Celiac_vs_Control_in_IGpos_Age2.5 = "IGpos_Celiac_2.5 - IGpos_Control_2.5", 
+  IGpos_vs_IGneg_in_Control_Age2.5 = "IGpos_Control_2.5 - IGneg_Control_2.5",  
+  IGpos_vs_IGneg_in_Celiac_Age2.5 = "IGpos_Celiac_2.5 - IGneg_Celiac_2.5",
+  
+  Celiac_vs_Control_in_Presort_Age5 = "Presort_Celiac_5 - Presort_Control_5",
+  Celiac_vs_Control_in_IGneg_Age5 = "IGneg_Celiac_5 - IGneg_Control_5",
+  Celiac_vs_Control_in_IGpos_Age5 = "IGpos_Celiac_5 - IGpos_Control_5", 
+  IGpos_vs_IGneg_in_Control_Age5 = "IGpos_Control_5 - IGneg_Control_5",  
+  IGpos_vs_IGneg_in_Celiac_Age5 = "IGpos_Celiac_5 - IGneg_Celiac_5"
+)
+
+# Differential analysis using Mann-Whitney U test (non-parametric alternative to t-test)
+# Initialize a list to store results for each contrast
+results_list <- list()
+
+# Loop over each contrast to perform the Mann-Whitney U test
+for (i in seq_along(contr.v)) {
+  contrast_name <- names(contr.v)[i]
+  contrast <- contr.v[i]
+  
+  # Parse the contrast to extract group labels
+  groups <- unlist(strsplit(contrast, " - "))
+  group1 <- groups[1]
+  group2 <- groups[2]
+  
+  # Get sample indices for each group based on metadata
+  idx1 <- which(md$Group == group1)
+  idx2 <- which(md$Group == group2)
+  
+  # Initialize vectors to store test results
+  pathway <- rownames(pwys.tab)
+  mean1 <- numeric(length(pathway))
+  mean2 <- numeric(length(pathway))
+  mean_diff <- numeric(length(pathway))
+  p_value <- numeric(length(pathway))
+  stat_value <- numeric(length(pathway))
+  
+  # Loop over each pathway to perform the test
+  for (j in seq_along(pathway)) {
+    pathway_j <- pathway[j]
+    values1 <- pwys.tab[pathway_j, idx1]
+    values2 <- pwys.tab[pathway_j, idx2]
+    
+    # Check if both groups have at least one observation
+    if (length(values1) > 0 && length(values2) > 0) {
+      # Perform the Mann-Whitney U test
+      wt <- wilcox.test(values1, values2, exact = FALSE)
+      p_value[j] <- wt$p.value
+      stat_value[j] <- wt$statistic
+    } else {
+      # Set p-value and statistic to NA
+      p_value[j] <- NA
+      stat_value[j] <- NA
+    }
+    
+    # Compute mean differences between groups
+    mean1[j] <- mean(values1)
+    mean2[j] <- mean(values2)
+    mean_diff[j] <- mean1[j] - mean2[j]
+  }
+  
+  # Adjust p-values for multiple testing using FDR
+  adj_p_value <- p.adjust(p_value, method = "fdr")
+  
+  # Create a data frame for this contrast
+  df_contrast <- data.frame(
+    Pathway = pathway,
+    Contrast = contrast_name,
+    Group1 = group1,
+    Group2 = group2,
+    Mean_Group1 = mean1,
+    Mean_Group2 = mean2,
+    Mean_Difference = mean_diff,
+    Statistic = stat_value,
+    P.Value = p_value,
+    adj.P.Val = adj_p_value
+  )
+  
+  # Add the results to the list
+  results_list[[contrast_name]] <- df_contrast
+}
+
+# Combine results from all contrasts into a single data frame
+mtt.df <- do.call(rbind, results_list)
+
+# Add pathway annotations
+mtt.df <- merge(mtt.df, annot, by.x = "Pathway", by.y = "row.names", all.x = TRUE)
+
+# Round numeric columns for better readability
+numeric_cols <- sapply(mtt.df, is.numeric)
+mtt.df[, numeric_cols] <- signif(mtt.df[, numeric_cols], 3)
+
+# Save results to CSV
+write.csv(mtt.df, "kegg_pwys_stats.csv", row.names = FALSE, na = "")
+
+# Select top pathways based on adjusted p-values for "Presort" contrasts
+library(dplyr)
+top_contrasts_presort <- names(contr.v)[grep("Presort", names(contr.v))]
+mtt.df_presort <- mtt.df %>% filter(Contrast %in% top_contrasts_presort)
+pwy_pvals_presort <- mtt.df_presort %>%
+  group_by(Pathway) %>%
+  summarise(min_adj_P_Val = min(adj.P.Val, na.rm = TRUE)) %>%
+  arrange(min_adj_P_Val)
+# Select top 30 pathways
+top_pwy_presort <- pwy_pvals_presort$Pathway[1:30]
+
+# Presort boxplots for top pathways
+pdf("top_kegg_pwys_boxplot_presort.pdf", width=9, height=3)
+for (pwy in top_pwy_presort) {
+  dat2p <- data.frame(
+    logabun = pwys.tab[pwy, md$Sort == "Presort"], 
+    md[md$Sort == "Presort", ]
+  )
+  
+  ggp <- ggplot(dat2p, aes(x = Disease.status, y = logabun)) + 
+    theme_bw() +
+    ggtitle(substr(annot[pwy, "Pathway"], 1, 80)) + 
+    theme(legend.position = "none") + 
+    ylab("Log2 abundance") +
+    geom_boxplot(aes(fill = Disease.status)) + 
+    facet_grid(~ Age)
+  print(ggp)
+}
+dev.off()
+
+# Create heatmaps for top pathways in Presort samples
+source("fcns/ezheat.R")  # Make sure this file exists
+source("fcns/prune_mat.R")
+md.df_presort <- md[md$Sort == "Presort", c("Disease.status", "Age")]
+gaps.col_presort <- which(diff(as.numeric(as.factor(md.df_presort$Age)), lag=1) != 0)
+
+ezheat(pwys.tab[top_pwy_presort, md$Sort == "Presort"], 
+       pheno.df = md.df_presort,  
+       sc = "z", 
+       reorder_rows = TRUE,
+       labrows = substr(annot[top_pwy_presort, "Pathway"], 1, 80), 
+       labcols = "",
+       gaps_col = gaps.col_presort, 
+       main = "Log2 abundance", 
+       name = "top_kegg_pwys_heat_presort", 
+       height = 8, 
+       width = 16, 
+       clip = 2)
+
+# Select top pathways based on adjusted p-values for "Postsort" contrasts
+top_contrasts_postsort <- names(contr.v)[grep("IGneg|IGpos", names(contr.v))]
+mtt.df_postsort <- mtt.df %>% filter(Contrast %in% top_contrasts_postsort)
+pwy_pvals_postsort <- mtt.df_postsort %>%
+  group_by(Pathway) %>%
+  summarise(min_adj_P_Val = min(adj.P.Val, na.rm = TRUE)) %>%
+  arrange(min_adj_P_Val)
+# Select top 30 pathways
+top_pwy_postsort <- pwy_pvals_postsort$Pathway[1:30]
+
+# Postsort boxplots for top pathways
+pdf("top_kegg_pwys_boxplot_postsort.pdf", width=9, height=3)
+for (pwy in top_pwy_postsort) {
+  # Subset data for Postsort samples (IGneg and IGpos)
+  dat2p <- data.frame(
+    logabun = pwys.tab[pwy, md$Sorted == "Postsort"], 
+    md[md$Sorted == "Postsort", ]
+  )
+  
+  # Create the boxplot
+  ggp <- ggplot(dat2p, aes(x = Sort, y = logabun, fill = Sort)) + 
+    theme_bw() +
+    ggtitle(substr(annot[pwy, "Pathway"], 1, 80)) + 
+    ylab("Log2 abundance") +
+    geom_boxplot() + 
+    facet_grid(Disease.status ~ Age)
+  print(ggp)
+}
+dev.off()
+
+# Create heatmaps for top pathways in Postsort samples
+md.df_postsort <- md[md$Sorted == "Postsort", c("Sort", "Disease.status", "Age")]
+gaps.col_postsort <- which(diff(as.numeric(as.factor(md.df_postsort$Age)), lag=1) != 0)
+
+ezheat(pwys.tab[top_pwy_postsort, md$Sorted == "Postsort"], 
+       pheno.df = md.df_postsort,  
+       sc = "z", 
+       reorder_rows = TRUE,
+       labrows = substr(annot[top_pwy_postsort, "Pathway"], 1, 80), 
+       labcols = "",
+       gaps_col = gaps.col_postsort, 
+       main = "Log2 abundance", 
+       name = "top_kegg_pwys_heat_postsort", 
+       height = 8, 
+       width = 16, 
+       clip = 2)
 
 
 ```
+
+
+
 
 # Session Info
 
