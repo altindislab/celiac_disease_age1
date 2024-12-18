@@ -760,129 +760,59 @@ write.csv(beta_stats, "beta_diversity_statistics_summary.csv", row.names = FALSE
 
 ```
 
+
+###Firmicutes vs Bacteroidetes_Ratio
 ```{r}
-library(patchwork)
-library(tidyverse)
+# First, analyze at phylum level
+ps_phylum <- tax_glom(ps_rel, taxrank="Phylum")
+# Convert to relative abundance
+ps_phylum_rel <- transform_sample_counts(ps_phylum, function(x) x/sum(x) * 100)
 
-# Beta Diversity Analysis
-##USE ps_rarefied for this
-# First, add CellType to sample data
-sample_data(ps_rarefied)$CellType <- factor(gsub("(.+)_(.+)_.*", "\\1", sample_data(ps_rarefied)$Group),
-                                  levels=c("Presort", "IGpos", "IGneg"))
-sample_data(ps_rarefied)$Disease.status <- factor(gsub("(.+)_(.+)_.*", "\\2", sample_data(ps_rarefied)$Group),
-                                       levels=c("Control", "Celiac"))
-
-# Function to perform PERMANOVA and get statistics
-perform_beta_stats <- function(ps_obj, cell_type) {
-    ps_subset <- subset_samples(ps_obj, CellType == cell_type)
-    metadata_subset <- data.frame(sample_data(ps_subset))
-    
-    # Calculate distances
-    bray_dist <- phyloseq::distance(ps_subset, method="bray")
-    
-    # Perform PERMANOVA
-    permanova <- adonis2(bray_dist ~ Disease.status, data=metadata_subset, permutations=9999)
-    
-    # Calculate centroids for each group
-    ord <- cmdscale(bray_dist, k=2)
-    centroids <- aggregate(ord, by=list(metadata_subset$Disease.status), mean)
-    
-    # Calculate dispersion
-    disp <- betadisper(bray_dist, metadata_subset$Disease.status)
-    disp_test <- permutest(disp, permutations=9999)
-    
-    return(list(
-        permanova = permanova,
-        dispersion = disp_test,
-        R2 = permanova$R2[1],
-        F_value = permanova$F[1],
-        p_value = permanova$`Pr(>F)`[1]
-    ))
+# Extract abundance matrix and taxonomy
+otu_mat <- as(otu_table(ps_phylum_rel), "matrix")
+if(taxa_are_rows(ps_phylum_rel)) {
+  otu_mat <- t(otu_mat)
 }
+tax_mat <- as(phyloseq::tax_table(ps_phylum_rel), "matrix")
+metadata <- data.frame(sample_data(ps_phylum_rel))
 
-# Function to create ordination plots (PCoA and NMDS)
-create_ordination_plots <- function(ps_obj, cell_type) {
-    ps_subset <- subset_samples(ps_obj, CellType == cell_type)
-    
-    # Calculate distances
-    bray_dist <- phyloseq::distance(ps_subset, method="bray")
-    
-    # Get statistics
-    stats <- perform_beta_stats(ps_obj, cell_type)
-    
-    # PCoA
-    pcoa <- ordinate(ps_subset, method="PCoA", distance=bray_dist)
-    pcoa_plot <- plot_ordination(ps_subset, pcoa, color="Disease.status") +
-        geom_point(size=3, alpha=0.7) +
-        stat_ellipse() +
-        scale_color_manual(values=c("Control"="#00AED7", "Celiac"="#FD9347")) +
-        theme_bw() +
-        theme(panel.grid.minor=element_blank(),
-              legend.position="none") +
-        ggtitle(paste0(cell_type, " - PCoA\n",
-                      "PERMANOVA R² = ", round(stats$R2, 3),
-                      ", p = ", round(stats$p_value, 3)))
-    
-    # NMDS
-    set.seed(1024)
-    nmds <- ordinate(ps_subset, method="NMDS", distance=bray_dist)
-    nmds_plot <- plot_ordination(ps_subset, nmds, color="Disease.status") +
-        geom_point(size=3, alpha=0.7) +
-        stat_ellipse() +
-        scale_color_manual(values=c("Control"="#00AED7", "Celiac"="#FD9347")) +
-        theme_bw() +
-        theme(panel.grid.minor=element_blank()) +
-        ggtitle(paste0(cell_type, " - NMDS\n",
-                      "stress = ", round(nmds$stress, 3)))
-    
-    return(list(pcoa=pcoa_plot, nmds=nmds_plot))
-}
+# Get Firmicutes and Bacteroidetes abundances
+firmicutes_idx <- which(tax_mat[, "Phylum"] == "Firmicutes")
+bacteroidetes_idx <- which(tax_mat[, "Phylum"] == "Bacteroidetes")
 
-# Generate plots and statistics for each cell type
-cell_types <- c("Presort", "IGpos", "IGneg")
-plot_list <- list()
-all_stats <- data.frame()
+# Calculate F/B ratio
+fb_ratio <- data.frame(
+  Sample = rownames(otu_mat),
+  Firmicutes = otu_mat[, firmicutes_idx],
+  Bacteroidetes = otu_mat[, bacteroidetes_idx],
+  stringsAsFactors = FALSE
+)
+fb_ratio$FB_Ratio <- fb_ratio$Firmicutes / fb_ratio$Bacteroidetes
+
+# Add metadata by matching sample names
+fb_ratio$Disease.status <- metadata[match(fb_ratio$Sample, rownames(metadata)), "Disease.status"]
+fb_ratio$CellType <- metadata[match(fb_ratio$Sample, rownames(metadata)), "CellType"]
+
+# Print first few rows to check
+print(head(fb_ratio))
+
+# Statistical testing
+cell_types <- unique(fb_ratio$CellType)
+stats_results <- data.frame()
 
 for(cell_type in cell_types) {
-    # Get ordination plots
-    plots <- create_ordination_plots(ps_rarefied, cell_type)
-    plot_list[[paste0(cell_type, "_pcoa")]] <- plots$pcoa
-    plot_list[[paste0(cell_type, "_nmds")]] <- plots$nmds
-    
-    # Collect statistics
-    stats <- perform_beta_stats(ps_rarefied, cell_type)
-    all_stats <- rbind(all_stats, data.frame(
-        CellType = cell_type,
-        Method = "PERMANOVA",
-        R2 = stats$R2,
-        F_statistic = stats$F_value,
-        p_value = stats$p_value,
-        stringsAsFactors = FALSE
-    ))
+  subset_data <- fb_ratio[fb_ratio$CellType == cell_type,]
+  test <- wilcox.test(FB_Ratio ~ Disease.status, data=subset_data)
+  
+  stats_results <- rbind(stats_results, data.frame(
+    CellType = cell_type,
+    p_value = test$p.value,
+    Control_median = median(subset_data$FB_Ratio[subset_data$Disease.status == "Control"]),
+    Celiac_median = median(subset_data$FB_Ratio[subset_data$Disease.status == "Celiac"])
+  ))
 }
+stats_results$adj_p_value <- p.adjust(stats_results$p_value, method="BH")
 
-# Combine plots
-combined_plot <- (plot_list$Presort_pcoa + plot_list$Presort_nmds) /
-                (plot_list$IGpos_pcoa + plot_list$IGpos_nmds) /
-                (plot_list$IGneg_pcoa + plot_list$IGneg_nmds) +
-    plot_layout(guides = "collect") +
-    plot_annotation(
-        title = "Beta Diversity Analysis",
-        subtitle = "Control vs Celiac comparison by cell type",
-        theme = theme(
-            plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
-            plot.subtitle = element_text(size = 10, hjust = 0.5)
-        )
-    )
-
-# Save plots and statistics
-ggsave("beta_diversity_ordination_plots.pdf", 
-       combined_plot, 
-       width = 12, 
-       height = 15, 
-       dpi = 300)
-
-write.csv(all_stats, "beta_diversity_statistics.csv", row.names = FALSE)
 ```
 
 #Taxonomic Composition
@@ -1396,304 +1326,145 @@ for(tax_level in tax_levels) {
 }
 ```
 
-#Heatpmaps
+#PCA and PCOA Analysis
 
 ```{r}
-library(ComplexHeatmap)
-library(circlize)
-library(viridis)
-library(tidyverse)
+# Load required libraries
 library(phyloseq)
-# Function to create improved professional heatmap
-create_professional_heatmap <- function(data_list, cell_type, selected_taxa, stats, tax_level) {
-  # Input validation
-  if(length(selected_taxa) == 0) {
-    warning("No taxa met the selection criteria")
-    return(NULL)
+library(ggplot2)
+library(vegan)
+library(dplyr)
+
+# Define color schemes
+control_color <- "#00AED7"  # Light blue
+celiac_color <- "#FD9347"   # Orange
+
+# Function to perform ordination analysis for a specific comparison
+perform_ordination_analysis <- function(ps, group1, group2, type = "PCA", output_prefix) {
+  # Filter samples for the specific comparison
+  subset_samples <- sample_data(ps)$Group %in% c(group1, group2)
+  ps_subset <- prune_samples(subset_samples, ps)
+  
+  # Create a simplified group designation
+  sample_data(ps_subset)$SimpleGroup <- factor(
+    ifelse(grepl("Control", sample_data(ps_subset)$Group), "Control", "Celiac"),
+    levels = c("Control", "Celiac")
+  )
+  
+  # Transform counts to relative abundance
+  ps_rel <- transform_sample_counts(ps_subset, function(x) x/sum(x))
+  
+  if(type == "PCA") {
+    # Perform PCA
+    ord <- ordinate(ps_rel, method = "RDA", distance = "euclidean")
+    
+    # Create PCA plot
+    p <- plot_ordination(ps_rel, ord, color = "SimpleGroup") +
+      geom_point(size = 3) +
+      stat_ellipse(type = "norm") +
+      scale_color_manual(values = c(Control = control_color, Celiac = celiac_color)) +
+      ggtitle(paste("PCA -", sub("_.*", "", group1), "Comparison")) +
+      theme_bw() +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 14),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 10)
+      )
+    
+  } else {  # PCoA
+    # Calculate Bray-Curtis distances and perform PCoA
+    ord <- ordinate(ps_rel, method = "PCoA", distance = "bray")
+    
+    # Create PCoA plot
+    p <- plot_ordination(ps_rel, ord, color = "SimpleGroup") +
+      geom_point(size = 3) +
+      stat_ellipse(type = "norm") +
+      scale_color_manual(values = c(Control = control_color, Celiac = celiac_color)) +
+      ggtitle(paste("PCoA -", sub("_.*", "", group1), "Comparison")) +
+      theme_bw() +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 14),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 10)
+      )
   }
   
-  # Subset data
-  samples <- data_list$metadata$CellType == cell_type
+  # Save plot
+  filename <- paste0(output_prefix, "_", sub("_.*", "", group1), "_comparison.pdf")
+  ggsave(filename, p, width = 8, height = 6)
   
-  # Handle matrix subsetting properly
-  if(length(selected_taxa) == 1) {
-    abu_mat <- matrix(data_list$abundance[selected_taxa, samples],
-                      nrow = 1,
-                      dimnames = list(selected_taxa, 
-                                      colnames(data_list$abundance)[samples]))
-  } else {
-    abu_mat <- data_list$abundance[selected_taxa, samples, drop = FALSE]
-  }
+  # Perform PERMANOVA
+  otu_mat <- t(otu_table(ps_rel)@.Data)
+  metadata <- data.frame(sample_data(ps_rel))
+  dist_mat <- vegdist(otu_mat, method = "bray")
   
-  metadata <- data_list$metadata[samples, ]
+  perm_result <- adonis2(dist_mat ~ SimpleGroup, data = metadata)
   
-  # Sort samples by Disease.status
-  col_order <- order(metadata$Disease.status)
-  abu_mat <- abu_mat[, col_order, drop = FALSE]
-  metadata <- metadata[col_order,]
+  # Save PERMANOVA results
+  write.csv(perm_result, 
+            paste0(output_prefix, "_PERMANOVA_", sub("_.*", "", group1), "_comparison.csv"))
   
-  # Log transform abundances
-  abu_mat_log <- log2(abu_mat + 1)
-  
-  # Enhanced column annotations with borders
-  column_ha <- HeatmapAnnotation(
-    Group = metadata$Disease.status,
-    col = list(Group = c(Control = "#2C7BB6", Celiac = "#D7191C")),
-    show_legend = TRUE,
-    annotation_legend_param = list(
-      Group = list(
-        title = "Disease Status",
-        title_gp = gpar(fontsize = 10, fontface = "bold"),
-        labels_gp = gpar(fontsize = 9)
-      )
-    ),
-    border = TRUE,
-    gap = unit(1, "mm")
-  )
-  
-  # Calculate fold changes for row annotation
-  fold_changes <- sapply(rownames(abu_mat), function(taxon) {
-    log2((mean(abu_mat[taxon, metadata$Disease.status == "Celiac"]) + 0.01) /
-           (mean(abu_mat[taxon, metadata$Disease.status == "Control"]) + 0.01))
-  })
-  
-  # Enhanced row annotations with better color scales
-  row_ha <- rowAnnotation(
-    'log2FC' = fold_changes,
-    'p-value' = -log10(stats$p_value[match(rownames(abu_mat), stats$Taxon)]),
-    col = list(
-      'log2FC' = colorRamp2(
-        c(min(fold_changes), 0, max(fold_changes)), 
-        c("#2C7BB6", "white", "#D7191C")
-      ),
-      'p-value' = colorRamp2(
-        c(0, 2, 4), 
-        viridis(3, option = "D")
-      )
-    ),
-    annotation_name_gp = gpar(fontsize = 9, fontface = "bold"),
-    annotation_legend_param = list(
-      log2FC = list(
-        title = "log2(Fold Change)",
-        title_gp = gpar(fontsize = 10, fontface = "bold"),
-        labels_gp = gpar(fontsize = 9)
-      ),
-      'p-value' = list(
-        title = "-log10(p-value)",
-        title_gp = gpar(fontsize = 10, fontface = "bold"),
-        labels_gp = gpar(fontsize = 9)
-      )
-    ),
-    border = TRUE,
-    gap = unit(1, "mm")
-  )
-  
-  # Enhanced color mapping for abundance
-  max_val <- max(abu_mat_log)
-  abundance_colors <- colorRampPalette(
-    c("#313695", "#4575B4", "#74ADD1", "#ABD9E9", "#E0F3F8", 
-      "#FFFFBF", "#FEE090", "#FDAE61", "#F46D43", "#D73027", "#A50026")
-  )(100)
-  
-  col_fun <- colorRamp2(
-    seq(0, max_val, length.out = length(abundance_colors)),
-    abundance_colors
-  )
-  
-  # Sort rows by fold change
-  row_order <- order(fold_changes, decreasing = TRUE)
-  
-  # Create enhanced heatmap
-  ht <- Heatmap(
-    abu_mat_log,
-    name = "log2(Abundance + 1)",
-    col = col_fun,
-    
-    # Clustering settings
-    cluster_rows = FALSE,
-    cluster_columns = FALSE,
-    row_order = row_order,
-    
-    # Enhanced appearance
-    rect_gp = gpar(col = "white", lwd = 0.5),  # Add grid lines
-    show_row_names = TRUE,
-    show_column_names = FALSE,
-    row_names_gp = gpar(fontsize = 8),
-    column_title = paste(cell_type, "-", tax_level, "Level Differential Taxa"),
-    column_title_gp = gpar(fontsize = 12, fontface = "bold"),
-    
-    # Legend enhancements
-    heatmap_legend_param = list(
-      title_gp = gpar(fontsize = 10, fontface = "bold"),
-      labels_gp = gpar(fontsize = 9),
-      legend_height = unit(4, "cm"),
-      title_position = "leftcenter-rot"
-    ),
-    
-    # Borders and spacing
-    border = TRUE,
-    border_gp = gpar(col = "black", lwd = 1.2),
-    
-    # Annotations
-    top_annotation = column_ha,
-    right_annotation = row_ha,
-    
-    # Additional formatting
-    use_raster = TRUE,
-    raster_quality = 4
-  )
-  
-  # Add padding and formatting to the overall plot
-  draw(ht, padding = unit(c(2, 2, 2, 2), "mm"),
-       heatmap_legend_side = "right",
-       annotation_legend_side = "right")
-  
-  return(ht)
+  return(list(plot = p, permanova = perm_result))
 }
 
-# Process each taxonomic level
-tax_levels <- c("Phylum", "Class", "Order", "Family", "Genus", "Species")
+# Perform analyses for each comparison
+# 1. Presort comparison
+presort_groups <- c("Presort_Control_1", "Presort_Celiac_1")
+pca_presort <- perform_ordination_analysis(ps, presort_groups[1], presort_groups[2], 
+                                           "PCA", "ordination_pca")
+pcoa_presort <- perform_ordination_analysis(ps, presort_groups[1], presort_groups[2], 
+                                            "PCoA", "ordination_pcoa")
 
-for(tax_level in tax_levels) {
-  cat(sprintf("\nProcessing %s level...\n", tax_level))
-  
-  # Prepare data for this level
-  ps_rel <- transform_sample_counts(ps_filtered_prev, function(x) x/sum(x) * 100)
-  ps_level <- tax_glom(ps_rel, taxrank=tax_level, NArm=FALSE)
-  
-  # Extract abundance matrix
-  abu_mat <- as(phyloseq::otu_table(ps_level), "matrix")
-  if(!taxa_are_rows(ps_level)) {
-    abu_mat <- t(abu_mat)
-  }
-  
-  # Create proper taxa names
-  tax_mat <- as(phyloseq::tax_table(ps_level), "matrix")
-  taxa_names <- sapply(1:nrow(tax_mat), function(i) {
-    if(!is.na(tax_mat[i, tax_level])) {
-      if(tax_level == "Species") {
-        genus <- tax_mat[i, "Genus"]
-        species <- tax_mat[i, "Species"]
-        if(!is.na(genus)) {
-          return(paste(genus, species))
-        } else {
-          return(species)
-        }
-      } else {
-        return(tax_mat[i, tax_level])
-      }
-    } else {
-      prev_cols <- 1:which(colnames(tax_mat) == tax_level)
-      prev_level_idx <- max(which(!is.na(tax_mat[i, prev_cols])))
-      if(is.finite(prev_level_idx)) {
-        return(paste0("Unclassified_", tax_mat[i, prev_cols[prev_level_idx]]))
-      } else {
-        return("Unclassified")
-      }
-    }
-  })
-  
-  rownames(abu_mat) <- make.unique(taxa_names, sep="_")
-  
-  # Create data list
-  level_data <- list(
-    abundance = abu_mat,
-    taxonomy = tax_mat,
-    metadata = data.frame(sample_data(ps_level))
+# 2. IGpos comparison
+igpos_groups <- c("IGpos_Control_1", "IGpos_Celiac_1")
+pca_igpos <- perform_ordination_analysis(ps, igpos_groups[1], igpos_groups[2], 
+                                         "PCA", "ordination_pca")
+pcoa_igpos <- perform_ordination_analysis(ps, igpos_groups[1], igpos_groups[2], 
+                                          "PCoA", "ordination_pcoa")
+
+# 3. IGneg comparison
+igneg_groups <- c("IGneg_Control_1", "IGneg_Celiac_1")
+pca_igneg <- perform_ordination_analysis(ps, igneg_groups[1], igneg_groups[2], 
+                                         "PCA", "ordination_pca")
+pcoa_igneg <- perform_ordination_analysis(ps, igneg_groups[1], igneg_groups[2], 
+                                          "PCoA", "ordination_pcoa")
+
+# Create combined plots for publication
+library(gridExtra)
+
+# Combine PCA plots
+combined_pca <- grid.arrange(
+  pca_presort$plot + ggtitle("Presort"),
+  pca_igpos$plot + ggtitle("IG+"),
+  pca_igneg$plot + ggtitle("IG-"),
+  ncol = 3
+)
+ggsave("combined_pca_plots.pdf", combined_pca, width = 18, height = 6)
+
+# Combine PCoA plots
+combined_pcoa <- grid.arrange(
+  pcoa_presort$plot + ggtitle("Presort"),
+  pcoa_igpos$plot + ggtitle("IG+"),
+  pcoa_igneg$plot + ggtitle("IG-"),
+  ncol = 3
+)
+ggsave("combined_pcoa_plots.pdf", combined_pcoa, width = 18, height = 6)
+
+# Save all PERMANOVA results in a single file
+all_permanova <- list(
+  Presort = pca_presort$permanova,
+  IGpos = pca_igpos$permanova,
+  IGneg = pca_igneg$permanova
+)
+
+write.csv(do.call(rbind, lapply(names(all_permanova), function(name) {
+  data.frame(
+    Comparison = name,
+    all_permanova[[name]]
   )
-  
-  # Process each cell type
-  for(cell_type in c("Presort", "IGpos", "IGneg")) {
-    cat(sprintf("  Analyzing %s...\n", cell_type))
-    
-    # Find striking taxa
-    striking_results <- find_striking_taxa(level_data$abundance, 
-                                           level_data$metadata,
-                                           cell_type)
-    
-    if(length(striking_results$selected_taxa) > 0) {
-      # Create output directory
-      dir.create("heatmaps", showWarnings = FALSE)
-      
-      # Create and save heatmap
-      ht <- create_professional_heatmap(level_data, 
-                                        cell_type,
-                                        striking_results$selected_taxa,
-                                        striking_results$statistics,
-                                        tax_level)
-      
-      if(!is.null(ht)) {
-        # Save heatmap with improved settings
-        pdf(paste0("heatmaps/", tolower(cell_type), "_", 
-                   tolower(tax_level), "_heatmap.pdf"),
-            width = 12,      # Increased width for better readability
-            height = 14,     # Increased height for better spacing
-            useDingbats = FALSE,  # Better PDF compatibility
-            family = "sans") # Use sans-serif font for better appearance
-        
-        # Draw heatmap with padding and proper legend placement
-        draw(ht, padding = unit(c(2, 2, 2, 2), "mm"),
-             heatmap_legend_side = "right",
-             annotation_legend_side = "right")
-        
-        dev.off()
-        
-        # Create PNG version for quick viewing
-        png(paste0("heatmaps/", tolower(cell_type), "_",
-                   tolower(tax_level), "_heatmap.png"),
-            width = 12, height = 14, units = "in", res = 300)
-        
-        draw(ht, padding = unit(c(2, 2, 2, 2), "mm"),
-             heatmap_legend_side = "right",
-             annotation_legend_side = "right")
-        
-        dev.off()
-      }
-      
-      # Save statistics
-      dir.create("statistics", showWarnings = FALSE)
-      write.csv(striking_results$statistics,
-                paste0("statistics/", tolower(cell_type), "_",
-                       tolower(tax_level), "_stats.csv"),
-                row.names = FALSE)
-      
-      # Print summary
-      cat(sprintf("\nSummary for %s - %s:\n", cell_type, tax_level))
-      print(striking_results$statistics %>%
-              dplyr::filter(adj_p_value < 0.05) %>%
-              dplyr::select(Taxon, fold_change, adj_p_value, mean_abundance) %>%
-              dplyr::arrange(adj_p_value) %>%
-              head(10))
-    }
-  }
-}
+})), "all_permanova_results.csv")
 
-# Create final summary
-cat("\nCreating final summary...\n")
-all_stats <- data.frame()
 
-for(tax_level in tax_levels) {
-  for(cell_type in c("Presort", "IGpos", "IGneg")) {
-    file_path <- paste0("statistics/", tolower(cell_type), "_",
-                        tolower(tax_level), "_stats.csv")
-    
-    if(file.exists(file_path)) {
-      stats <- read.csv(file_path)
-      stats$TaxonomicLevel <- tax_level
-      stats$CellType <- cell_type
-      all_stats <- rbind(all_stats, stats)
-    }
-  }
-}
-
-# Save comprehensive summary
-write.csv(all_stats %>%
-            dplyr::filter(adj_p_value < 0.05) %>%
-            dplyr::arrange(TaxonomicLevel, CellType, adj_p_value),
-          "statistics/significant_taxa_summary.csv",
-          row.names = FALSE)
-
-cat("\nAnalysis complete! Check 'heatmaps' and 'statistics' directories for results.\n")
 
 ```
 
